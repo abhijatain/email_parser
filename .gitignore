@@ -1,0 +1,13 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+# Parsed emails and extracted files may contain private data.
+output/

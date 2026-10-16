@@ -1,0 +1,36 @@
+From: Asha Example <asha@example.com>
+To: Robin Example <robin@example.com>
+Cc: Team Example <team@example.com>
+Reply-To: Asha Example <reply@example.com>
+Date: Fri, 16 Oct 2026 09:30:00 +0000
+Message-ID: <sample-report-20261016@example.com>
+Subject: =?UTF-8?Q?Quarterly_report_=E2=80=93_caf=C3=A9?=
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="sample-mixed-boundary"
+
+--sample-mixed-boundary
+Content-Type: multipart/alternative; boundary="sample-alternative-boundary"
+
+--sample-alternative-boundary
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Hello Robin,
+
+Please find the sample report attached.
+
+Asha
+--sample-alternative-boundary
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+<html><body><p>Hello Robin,</p><p>Please find the sample report attached.</p><p>Asha</p></body></html>
+--sample-alternative-boundary--
+
+--sample-mixed-boundary
+Content-Type: text/plain; charset="utf-8"
+Content-Disposition: attachment; filename="report.txt"
+Content-Transfer-Encoding: 7bit
+
+Sample report for 16 October 2026.
+--sample-mixed-boundary--
