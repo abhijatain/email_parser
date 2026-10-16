@@ -44,6 +44,8 @@
 
         <section class="overview" aria-label="Mailbox overview" id="overview"></section>
 
+        <section id="classifier-panel" class="classifier-panel" aria-label="Jev AI classification status" aria-live="polite" aria-atomic="true" hidden></section>
+
         <section class="inbox-section" aria-label="Your messages">
           <div class="inbox-controls">
             <div class="view-tabs" role="group" aria-label="Message display"><button id="priority-mode" class="view-tab active" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3l-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/></svg>Priority view</button><button id="all-mode" class="view-tab" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>All messages</button></div>
@@ -53,7 +55,7 @@
           <div class="error-banner" id="error-banner" role="alert" hidden><span id="error-text"></span><button id="retry-button" class="text-button">Try again</button></div>
           <div id="messages-content" class="messages-content" aria-live="polite" aria-busy="true"><div class="initial-loading"><span class="spinner"></span>Getting your inbox in order…</div></div>
         </section>
-        <footer class="page-footer"><span><span class="footer-dot"></span>All changes stay in this local demo.</span><span>Thoughtfully sorted. Clearly explained.</span></footer>
+        <footer class="page-footer"><span><span class="footer-dot"></span>Mailbox connection is simulated. Jev runs on the server.</span><span>Thoughtfully sorted. Clearly explained.</span></footer>
       </div>
     </main>
 

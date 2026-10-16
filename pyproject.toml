@@ -4,11 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "email-parser-local"
-version = "0.2.0"
-description = "A local email triage dashboard with a simulated inbox and MIME parsing."
+version = "0.3.0"
+description = "An email triage dashboard with Jev AI decisions and a simulated inbox."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "typesafe-sdk==0.7.5",
+]
 
 [project.scripts]
 email-parser = "email_parser.cli:main"

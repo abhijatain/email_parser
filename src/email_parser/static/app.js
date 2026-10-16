@@ -39,8 +39,9 @@
   const priorityLabels = { critical: "Critical", high: "High priority", normal: "Normal", low: "Low priority" };
   const priorityIcons = { critical: "lightning", high: "flag", normal: "check", low: "leaf" };
   const viewLabels = { inbox: "Inbox", unread: "Unread", starred: "Starred", archived: "Archived" };
-  const state = { messages: [], categories: [], summary: null, account: null, mode: "priority", view: "inbox", category: "", priority: "", search: "", loading: false, initialized: false, reader: null, readerRequest: 0, request: 0, controller: null, pending: new Set(), lastFocus: null, resetFocus: null };
+  const state = { messages: [], categories: [], summary: null, account: null, classifier: null, classifierBusy: false, classifierPanelKey: "", pollFailures: 0, mode: "priority", view: "inbox", category: "", priority: "", search: "", loading: false, initialized: false, reader: null, readerRequest: 0, request: 0, controller: null, pending: new Set(), lastFocus: null, resetFocus: null };
   let searchTimer;
+  let classificationPollTimer;
 
   function node(tag, attrs = {}, ...children) {
     const el = document.createElement(tag);
@@ -105,13 +106,17 @@
 
   function showError(error) { $("error-text").textContent = error.message || String(error); $("error-banner").hidden = false; }
 
-  async function loadInbox() {
+  async function loadInbox(options = {}) {
+    const quiet = options?.quiet === true;
     const request = ++state.request;
+    const readerId = state.reader?.id;
+    const readerToken = state.readerRequest;
     state.controller?.abort();
     state.controller = new AbortController();
     state.loading = true;
-    $("messages-content").setAttribute("aria-busy", "true");
-    $("refresh-indicator").hidden = !state.initialized;
+    if (!quiet) $("messages-content").setAttribute("aria-busy", "true");
+    $("messages-content").setAttribute("aria-live", quiet ? "off" : "polite");
+    $("refresh-indicator").hidden = quiet || !state.initialized;
     const query = new URLSearchParams({ view: state.view });
     if (state.search) query.set("search", state.search);
     if (state.category) query.set("category", state.category);
@@ -120,14 +125,18 @@
       const data = await api(`/api/inbox?${query}`, { signal: state.controller.signal });
       if (request !== state.request) return;
       state.account = data.account;
+      state.classifier = data.classifier || { configured: false, status: "needs_key", total: 0, complete: 0, pending: 0, failed: 0, manual: 0, model: "jev-latest" };
       state.categories = data.categories;
       state.summary = data.summary;
       state.messages = state.priority === "important" ? data.messages.filter((message) => ["critical", "high"].includes(message.priority)) : data.messages;
       state.initialized = true;
+      state.pollFailures = 0;
       $("error-banner").hidden = true;
-      render();
+      render({ quiet });
+      await refreshReaderClassification(data.messages, readerId, readerToken);
     } catch (error) {
       if (error.name === "AbortError" || request !== state.request) return;
+      if (quiet) state.pollFailures++;
       showError(error);
       if (!state.initialized) $("messages-content").replaceChildren(emptyState("Your inbox is taking a moment", "We couldn’t load the demo mailbox. Check that the server is running, then try again.", "Try again", loadInbox, "mail"));
     } finally {
@@ -135,15 +144,20 @@
         state.loading = false;
         $("messages-content").setAttribute("aria-busy", "false");
         $("refresh-indicator").hidden = true;
+        scheduleClassificationPoll();
       }
     }
   }
 
-  function render() {
+  function render(options = {}) {
+    const focusedMessage = options.quiet ? document.activeElement.dataset?.messageId : null;
+    const focusedAction = options.quiet ? document.activeElement.dataset?.messageAction : null;
     renderNavigation();
     renderOverview();
+    renderClassifierPanel();
     renderHeading();
     renderMessages();
+    if (focusedMessage) Array.from($("messages-content").querySelectorAll("[data-message-id]")).find((element) => element.dataset.messageId === focusedMessage && element.dataset.messageAction === focusedAction)?.focus({ preventScroll: true });
     $("priority-mode").classList.toggle("active", state.mode === "priority");
     $("all-mode").classList.toggle("active", state.mode === "all");
     $("priority-mode").setAttribute("aria-pressed", String(state.mode === "priority"));
@@ -159,6 +173,110 @@
 
   function createNavItem(view, count) {
     return node("button", { class: `nav-item${state.view === view && !state.category ? " active" : ""}`, "aria-current": state.view === view && !state.category ? "page" : null, onclick: () => setView(view) }, icon(view === "inbox" ? "inbox" : view === "unread" ? "unread" : view === "starred" ? "star" : "archive"), node("span", {}, viewLabels[view]), node("span", { class: "nav-count" }, count ?? "—"));
+  }
+
+  function classificationState(message) {
+    const classification = message.classification || { provider: "rules", status: "preview" };
+    if (message.overridden || classification.status === "manual") return { type: "manual", label: "Your choice", title: "Your category and priority are preserved. Jev will not replace them." };
+    if (classification.provider === "jev" && classification.status === "complete") return { type: "complete", label: "Jev AI", title: `Assessed by ${classification.model || "Jev"}. View the message for decision confidence.` };
+    if (classification.status === "failed") return { type: "failed", label: "AI needs retry", title: "Jev could not complete this assessment. The current labels are provisional." };
+    if (["pending", "processing", "queued"].includes(classification.status)) return { type: "pending", label: classification.provider === "jev" ? "Jev update pending" : "Preview · AI pending", title: classification.provider === "jev" ? "A previous Jev result is shown while the current assessment is pending." : "Local preview labels are shown while Jev assesses this message." };
+    return { type: "preview", label: "Rule preview", title: "This category and priority come from local rules. Jev has not assessed this message." };
+  }
+
+  function classificationBadge(message) {
+    const assessment = classificationState(message);
+    return node("span", { class: `classification-badge classification-${assessment.type}`, title: assessment.title }, icon(assessment.type === "complete" ? "sparkles" : assessment.type === "manual" ? "check" : assessment.type === "failed" ? "warning" : "other"), assessment.label);
+  }
+
+  function renderClassifierPanel() {
+    const status = state.classifier;
+    if (!status) return;
+    const signature = JSON.stringify([status, state.classifierBusy]);
+    if (signature === state.classifierPanelKey) return;
+    state.classifierPanelKey = signature;
+    const configured = status.configured === true;
+    const processing = configured && status.status !== "error" && (status.status === "processing" || status.pending > 0);
+    const error = configured && status.status === "error";
+    const total = Math.max(0, Number(status.total || 0) - Number(status.manual || 0));
+    const complete = Number(status.complete || 0);
+    const model = status.model || "jev-latest";
+    const title = !configured ? "Jev is ready when you are" : error ? "Jev assessment paused" : processing ? "Jev is finding what matters" : complete ? "Your inbox, assessed by Jev" : "Jev is ready for new mail";
+    const description = !configured ? "Configure TYPESAFE_API_KEY on the server to enable Jev. Unassessed messages show local rule previews." : error ? (status.error || "The AI provider could not complete an assessment. Retry when the connection or configuration is ready.") : processing ? "Typed category and priority decisions are arriving. Pending messages keep their current labels until assessed." : complete ? "Category and priority decisions come from Jev. Your manual choices are always preserved." : "Your manual choices are preserved. New messages will be assessed by Jev.";
+    const panel = $("classifier-panel");
+    panel.hidden = false;
+    panel.className = `classifier-panel classifier-panel-${!configured ? "setup" : error ? "error" : processing ? "processing" : "ready"}`;
+    const body = node("div", { class: "classifier-copy" }, node("div", { class: "classifier-heading" }, node("strong", {}, title), node("span", { class: "classifier-model" }, model), node("span", { class: "classifier-state" }, !configured ? "Setup needed" : error ? "Needs attention" : processing ? "Assessing" : "Ready")), node("p", {}, description));
+    if (configured) {
+      body.append(node("div", { class: "classifier-progress-meta" }, node("span", {}, `${complete} of ${total} assessed${status.manual ? ` · ${status.manual} kept manual` : ""}${status.failed ? ` · ${status.failed} failed` : ""}`), processing ? node("span", {}, `${status.pending} pending`) : null));
+      if (processing) body.append(node("div", { class: "classifier-progress", role: "progressbar", "aria-label": "Jev assessment progress", "aria-valuemin": 0, "aria-valuemax": total || 1, "aria-valuenow": Math.min(complete, total), "aria-valuetext": `${complete} of ${total} assessed` }, node("span", { style: `width:${total ? Math.min(100, Math.round(complete / total * 100)) : 0}%` })));
+    }
+    const action = !configured ? node("span", { class: "classifier-setup-note" }, "Server setup required") : processing ? node("span", { class: "classifier-working" }, node("span", { class: "spinner" }), "Working in the background") : button(state.classifierBusy ? "Queuing…" : error ? "Retry Jev" : "Reclassify", "button button-outline classifier-action", () => runClassification(error ? "retry" : "run"), error ? "sync" : "sparkles", { id: "classifier-action", disabled: state.classifierBusy });
+    panel.replaceChildren(node("span", { class: "classifier-brand", "aria-hidden": "true" }, icon("sparkles"), node("span", {}, "Jev AI")), body, action);
+  }
+
+  async function runClassification(action) {
+    if (state.classifierBusy) return;
+    state.classifierBusy = true;
+    renderClassifierPanel();
+    try {
+      const result = await api(`/api/classification/${action}`, { method: "POST", body: "{}" });
+      state.classifier = result.classifier || result;
+      await loadInbox({ quiet: true });
+      toast(action === "retry" ? "Jev assessment resumed. Your manual choices stay as they are." : "Jev assessment queued. Your manual choices stay as they are.");
+    } catch (error) { toast(error.message, true); await loadInbox({ quiet: true }); }
+    finally { state.classifierBusy = false; renderClassifierPanel(); scheduleClassificationPoll(); }
+  }
+
+  function scheduleClassificationPoll() {
+    window.clearTimeout(classificationPollTimer);
+    const status = state.classifier;
+    if (document.visibilityState === "hidden" || !status?.configured || ["needs_key", "error"].includes(status.status) || !(status.status === "processing" || status.pending > 0)) return;
+    classificationPollTimer = window.setTimeout(() => {
+      if (state.loading || state.pending.size || state.classifierBusy) scheduleClassificationPoll();
+      else loadInbox({ quiet: true });
+    }, 2000 * Math.min(5, 1 + state.pollFailures));
+  }
+
+  function readerBadges(message) {
+    return [priorityBadge(message.priority), node("span", { class: "category-chip" }, icon(message.category), categoryName(message.category)), classificationBadge(message)];
+  }
+
+  function readerAssessment(message) {
+    const classification = message.classification || { provider: "rules", status: "preview" };
+    const assessment = classificationState(message);
+    const reasons = message.reasons?.length ? message.reasons : [assessment.type === "manual" ? "Your category and priority have been saved." : "No assessment notes are available."];
+    const title = assessment.type === "complete" ? "Jev decision & app rubric" : assessment.type === "manual" ? "Your classification" : assessment.type === "failed" ? "AI assessment incomplete" : "Preview classification";
+    const explanation = assessment.type === "complete" ? "Jev returns typed decisions. These notes describe the app’s priority rubric; they are not a model-written explanation." : assessment.type === "manual" ? "Your choices are preserved and excluded from automatic reassessment." : assessment.type === "failed" ? "Jev could not complete the current assessment. Retry from the Jev panel. Current labels remain provisional." : classification.provider === "jev" ? "Showing a previous Jev decision while the updated assessment is pending." : "These labels come from local rules, not Jev. They remain a preview until Jev completes an assessment.";
+    const details = node("section", { class: `reader-explanation assessment-${assessment.type}`, id: "reader-assessment", "aria-label": title }, node("div", { class: "explanation-header" }, node("h3", {}, icon(assessment.type === "complete" ? "sparkles" : assessment.type === "manual" ? "check" : "other"), title), node("span", { class: "score-chip" }, `Priority score ${message.score}/100`)), node("p", { class: "assessment-description" }, explanation));
+    if (assessment.type === "complete") {
+      const confidence = (value) => typeof value === "number" && Number.isFinite(value) ? `${Math.round(value * 100)}%` : "Not available";
+      details.append(node("dl", { class: "assessment-facts" }, node("div", {}, node("dt", {}, "Model"), node("dd", {}, classification.model || "Jev")), node("div", {}, node("dt", {}, "Category confidence"), node("dd", {}, confidence(classification.category_confidence))), node("div", {}, node("dt", {}, "Priority confidence"), node("dd", {}, confidence(classification.priority_confidence)))));
+      details.append(node("p", { class: "assessment-confidence-note" }, "Confidence measures certainty in the decision, not urgency."));
+      if (classification.assessed_at) details.append(node("p", { class: "assessment-timestamp" }, `Assessed ${fullDate(classification.assessed_at)}`));
+    }
+    details.append(node("ul", {}, reasons.map((reason) => node("li", {}, reason))));
+    if (message.labels?.length) details.append(node("div", { class: "reader-labels", "aria-label": "Labels" }, message.labels.map((label) => node("span", { class: "message-label" }, label))));
+    return details;
+  }
+
+  async function refreshReaderClassification(messages, id, token) {
+    if (!id || state.reader?.id !== id || token !== state.readerRequest || state.pending.has(id)) return;
+    let updated = messages.find((message) => message.id === id);
+    if (!updated) {
+      try { updated = await api(`/api/messages/${encodeURIComponent(id)}`); }
+      catch (_) { return; }
+    }
+    if (state.reader?.id !== id || token !== state.readerRequest || state.pending.has(id)) return;
+    const fields = ["category", "priority", "score", "labels", "reasons", "classification", "overridden"];
+    if (fields.every((field) => JSON.stringify(updated[field]) === JSON.stringify(state.reader[field]))) return;
+    for (const field of fields) state.reader[field] = updated[field];
+    const scroll = $("reader").scrollTop;
+    $("reader-badges")?.replaceChildren(...readerBadges(state.reader));
+    $("reader-assessment")?.replaceWith(readerAssessment(state.reader));
+    if (document.activeElement !== $("reader-category")) $("reader-category").value = state.reader.category;
+    if (document.activeElement !== $("reader-priority")) $("reader-priority").value = state.reader.priority;
+    $("reader").scrollTop = scroll;
   }
 
   function renderOverview() {
@@ -189,17 +307,17 @@
   function priorityBadge(priority) { return node("span", { class: `priority-badge priority-${priority}` }, icon(priorityIcons[priority] || "check"), priorityLabels[priority] || priority); }
 
   function starButton(message) {
-    return button("", `star-button${message.starred ? " is-starred" : ""}`, () => patchMessage(message.id, { starred: !message.starred }, message.starred ? "Star removed." : "Message starred."), "star", { "aria-label": `${message.starred ? "Unstar" : "Star"} ${message.subject || "message"}`, "aria-pressed": String(message.starred), disabled: state.pending.has(message.id), title: message.starred ? "Remove star" : "Star message" });
+    return button("", `star-button${message.starred ? " is-starred" : ""}`, () => patchMessage(message.id, { starred: !message.starred }, message.starred ? "Star removed." : "Message starred."), "star", { "data-message-id": message.id, "data-message-action": "star", "aria-label": `${message.starred ? "Unstar" : "Star"} ${message.subject || "message"}`, "aria-pressed": String(message.starred), disabled: state.pending.has(message.id), title: message.starred ? "Remove star" : "Star message" });
   }
 
   function messageCard(message) {
     const name = message.sender.name || message.sender.address || "Unknown sender";
     const subject = message.subject || "(No subject)";
-    const footer = node("div", { class: "message-footer" }, priorityBadge(message.priority));
-    const extraLabel = (message.labels || []).find((label) => ![message.category, message.priority].includes(label.toLowerCase()) && label.toLowerCase() !== "priority");
-    if (extraLabel) footer.append(node("span", { class: "message-label" }, extraLabel));
+    const footer = node("div", { class: "message-footer" }, priorityBadge(message.priority), classificationBadge(message));
+    const extraLabel = (message.labels || []).find((label) => ![message.category, message.priority, "jev ai", "priority"].includes(label.toLowerCase()));
+    if (extraLabel && classificationState(message).type === "complete") footer.append(node("span", { class: "message-label additional-message-label" }, extraLabel));
     if (message.attachments?.length) footer.append(node("span", { class: "attachment-hint", "aria-label": `${message.attachments.length} attachments` }, icon("paperclip"), message.attachments.length));
-    return node("article", { class: `message-card${message.unread ? " unread" : ""}` }, node("button", { class: "message-open", onclick: (event) => openMessage(message.id, event.currentTarget), "aria-label": `Open ${subject}, from ${name}${message.unread ? ", unread" : ""}` }, node("div", { class: "message-head" }, node("span", { class: "sender-avatar", "aria-hidden": "true" }, initials(name)), node("span", { class: "sender-name" }, name), node("time", { class: "message-date", datetime: message.received_at, title: fullDate(message.received_at) }, compactDate(message.received_at))), node("div", { class: "message-subject-line" }, message.unread ? node("span", { class: "unread-dot", "aria-hidden": "true" }) : null, node("span", { class: "message-subject" }, subject)), node("p", { class: "message-preview" }, message.preview || "No preview available."), footer), starButton(message));
+    return node("article", { class: `message-card${message.unread ? " unread" : ""}` }, node("button", { class: "message-open", "data-message-id": message.id, "data-message-action": "open", onclick: (event) => openMessage(message.id, event.currentTarget), "aria-label": `Open ${subject}, from ${name}${message.unread ? ", unread" : ""}` }, node("div", { class: "message-head" }, node("span", { class: "sender-avatar", "aria-hidden": "true" }, initials(name)), node("span", { class: "sender-name" }, name), node("time", { class: "message-date", datetime: message.received_at, title: fullDate(message.received_at) }, compactDate(message.received_at))), node("div", { class: "message-subject-line" }, message.unread ? node("span", { class: "unread-dot", "aria-hidden": "true" }) : null, node("span", { class: "message-subject" }, subject)), node("p", { class: "message-preview" }, message.preview || "No preview available."), footer), starButton(message));
   }
 
   function renderMessages() {
@@ -229,7 +347,7 @@
 
   function messageRow(message) {
     const name = message.sender.name || message.sender.address || "Unknown sender";
-    return node("article", { class: `message-row${message.unread ? " unread" : ""}` }, node("button", { class: "row-open", onclick: (event) => openMessage(message.id, event.currentTarget), "aria-label": `Open ${message.subject || "message"}, from ${name}${message.unread ? ", unread" : ""}` }, node("span", { class: "row-sender" }, node("span", { class: "sender-avatar", "aria-hidden": "true" }, initials(name)), node("span", { class: "sender-name" }, name)), node("span", { class: "row-message" }, node("span", { class: "message-subject-line" }, message.unread ? node("span", { class: "unread-dot", "aria-hidden": "true" }) : null, node("span", { class: "message-subject" }, message.subject || "(No subject)")), node("span", { class: "message-preview" }, message.preview || "No preview available."), node("span", { class: "row-category" }, icon(message.category), categoryName(message.category))), priorityBadge(message.priority), node("time", { class: "row-date", datetime: message.received_at, title: fullDate(message.received_at) }, compactDate(message.received_at))), starButton(message));
+    return node("article", { class: `message-row${message.unread ? " unread" : ""}` }, node("button", { class: "row-open", "data-message-id": message.id, "data-message-action": "open", onclick: (event) => openMessage(message.id, event.currentTarget), "aria-label": `Open ${message.subject || "message"}, from ${name}${message.unread ? ", unread" : ""}` }, node("span", { class: "row-sender" }, node("span", { class: "sender-avatar", "aria-hidden": "true" }, initials(name)), node("span", { class: "sender-name" }, name)), node("span", { class: "row-message" }, node("span", { class: "message-subject-line" }, message.unread ? node("span", { class: "unread-dot", "aria-hidden": "true" }) : null, node("span", { class: "message-subject" }, message.subject || "(No subject)")), node("span", { class: "message-preview" }, message.preview || "No preview available."), node("span", { class: "row-category" }, icon(message.category), categoryName(message.category), classificationBadge(message))), priorityBadge(message.priority), node("time", { class: "row-date", datetime: message.received_at, title: fullDate(message.received_at) }, compactDate(message.received_at))), starButton(message));
   }
 
   function emptyState(title, description, actionLabel, action, iconName) {
@@ -270,17 +388,15 @@
     const focusedId = $("reader").contains(document.activeElement) ? document.activeElement.id : null;
     const name = message.sender.name || message.sender.address || "Unknown sender";
     const busy = state.pending.has(message.id);
-    const categoryChip = node("span", { class: "category-chip" }, icon(message.category), categoryName(message.category));
     const star = button(message.starred ? "Starred" : "Star", `button button-outline${message.starred ? " is-starred" : ""}`, () => patchMessage(message.id, { starred: !message.starred }, message.starred ? "Star removed." : "Message starred."), "star", { id: "reader-star", disabled: busy, "aria-pressed": String(message.starred) });
     const read = button(message.unread ? "Mark as read" : "Mark unread", "button button-outline", () => patchMessage(message.id, { unread: !message.unread }, message.unread ? "Marked as read." : "Marked as unread."), message.unread ? "check" : "unread", { id: "reader-read", disabled: busy });
     const archive = button(message.archived ? "Restore to inbox" : "Archive", "button button-outline", () => patchMessage(message.id, { archived: !message.archived }, message.archived ? "Restored to inbox." : "Message archived."), message.archived ? "restore" : "archive", { id: "reader-archive", disabled: busy });
-    const categorySelect = node("select", { id: "reader-category", disabled: busy, onchange: (event) => patchMessage(message.id, { category: event.target.value }, "Category updated.") }, state.categories.map((category) => node("option", { value: category.id }, category.name)));
+    const categorySelect = node("select", { id: "reader-category", disabled: busy, onchange: (event) => patchMessage(message.id, { category: event.target.value }, "Category updated."), onblur: (event) => { if (state.reader?.id === message.id && !state.pending.has(message.id)) event.target.value = state.reader.category; } }, state.categories.map((category) => node("option", { value: category.id }, category.name)));
     categorySelect.value = message.category;
-    const prioritySelect = node("select", { id: "reader-priority", disabled: busy, onchange: (event) => patchMessage(message.id, { priority: event.target.value }, "Priority updated.") }, Object.keys(priorityLabels).map((priority) => node("option", { value: priority }, priorityLabels[priority])));
+    const prioritySelect = node("select", { id: "reader-priority", disabled: busy, onchange: (event) => patchMessage(message.id, { priority: event.target.value }, "Priority updated."), onblur: (event) => { if (state.reader?.id === message.id && !state.pending.has(message.id)) event.target.value = state.reader.priority; } }, Object.keys(priorityLabels).map((priority) => node("option", { value: priority }, priorityLabels[priority])));
     prioritySelect.value = message.priority;
     const attachments = message.attachments?.length ? node("section", { class: "reader-attachments", "aria-label": "Attachments" }, node("h3", { class: "reader-section-title" }, `Attachments · ${message.attachments.length}`), message.attachments.map((attachment) => node("div", { class: "attachment" }, icon("file"), node("div", {}, node("div", { class: "attachment-name" }, attachment.filename || "Unnamed attachment"), node("div", { class: "attachment-meta" }, `${formatSize(attachment.size)} · ${attachment.content_type || "File"}`))))) : null;
-    const reasons = message.reasons?.length ? message.reasons : ["Sorted using local, explainable rules."];
-    $("reader-content").replaceChildren(node("div", { class: "reader-toolbar" }, node("span", { class: "reader-toolbar-label" }, "A MOMENT FOR THIS MESSAGE"), button("", "icon-button", closeReader, "close", { id: "close-reader", "aria-label": "Close message" })), node("div", { class: "reader-body" }, node("div", { class: "reader-badges" }, priorityBadge(message.priority), categoryChip, message.overridden ? node("span", { class: "override-chip" }, "Manually sorted") : null), node("h2", { id: "reader-subject" }, message.subject || "(No subject)"), node("div", { class: "reader-sender" }, node("span", { class: "sender-avatar", "aria-hidden": "true" }, initials(name)), node("div", { class: "reader-sender-info" }, node("div", { class: "reader-sender-name" }, name), node("div", { class: "reader-address" }, message.sender.address), node("div", { class: "reader-to" }, `To: ${(message.to || []).map((recipient) => recipient.name ? `${recipient.name} <${recipient.address}>` : recipient.address).join(", ") || "Not specified"}`)), node("time", { class: "reader-received", datetime: message.received_at }, fullDate(message.received_at))), node("div", { class: "reader-actions", "aria-label": "Message actions" }, star, read, archive), node("div", { class: "email-body", "aria-label": "Email body" }, message.text || "This message has no text content."), attachments, node("section", { class: "reader-explanation", "aria-label": "Why this message was prioritized" }, node("div", { class: "explanation-header" }, node("h3", {}, icon("sparkles"), "A little context"), node("span", { class: "score-chip" }, `Priority score ${message.score}/100`)), node("ul", {}, reasons.map((reason) => node("li", {}, reason))), message.labels?.length ? node("div", { class: "reader-labels", "aria-label": "Labels" }, message.labels.map((label) => node("span", { class: "message-label" }, label))) : null), node("section", { class: "reader-overrides", "aria-label": "Change classification" }, node("h3", { class: "reader-section-title" }, "Make it your own"), node("p", { class: "override-description" }, "A different place or priority? Your choices are saved automatically."), node("div", { class: "override-fields" }, node("label", { for: "reader-category" }, "Category", categorySelect), node("label", { for: "reader-priority" }, "Priority", prioritySelect))), node("div", { class: "reader-source" }, icon(message.source === "import" ? "upload" : "inbox"), message.source === "import" ? "Imported from a local .eml file" : "From your simulated mailbox · no account connected")));
+    $("reader-content").replaceChildren(node("div", { class: "reader-toolbar" }, node("span", { class: "reader-toolbar-label" }, "A MOMENT FOR THIS MESSAGE"), button("", "icon-button", closeReader, "close", { id: "close-reader", "aria-label": "Close message" })), node("div", { class: "reader-body" }, node("div", { class: "reader-badges", id: "reader-badges" }, readerBadges(message)), node("h2", { id: "reader-subject" }, message.subject || "(No subject)"), node("div", { class: "reader-sender" }, node("span", { class: "sender-avatar", "aria-hidden": "true" }, initials(name)), node("div", { class: "reader-sender-info" }, node("div", { class: "reader-sender-name" }, name), node("div", { class: "reader-address" }, message.sender.address), node("div", { class: "reader-to" }, `To: ${(message.to || []).map((recipient) => recipient.name ? `${recipient.name} <${recipient.address}>` : recipient.address).join(", ") || "Not specified"}`)), node("time", { class: "reader-received", datetime: message.received_at }, fullDate(message.received_at))), node("div", { class: "reader-actions", "aria-label": "Message actions" }, star, read, archive), node("div", { class: "email-body", "aria-label": "Email body" }, message.text || "This message has no text content."), attachments, readerAssessment(message), node("section", { class: "reader-overrides", "aria-label": "Change classification" }, node("h3", { class: "reader-section-title" }, "Make it your own"), node("p", { class: "override-description" }, "A different place or priority? Your choices are saved automatically."), node("div", { class: "override-fields" }, node("label", { for: "reader-category" }, "Category", categorySelect), node("label", { for: "reader-priority" }, "Priority", prioritySelect))), node("div", { class: "reader-source" }, icon(message.source === "import" ? "upload" : "inbox"), message.source === "import" ? "Imported from a local .eml file" : "From your simulated mailbox · no account connected")));
     if (focusedId && $(focusedId) && !$(focusedId).disabled) $(focusedId).focus({ preventScroll: true });
   }
 
@@ -314,7 +430,8 @@
     try {
       const result = await api("/api/demo/sync", { method: "POST", body: "{}" });
       await loadInbox();
-      toast(result.added ? `${result.added} new messages, already sorted. ${result.remaining_batches ? "More demo mail is ready whenever you are." : "That’s the last demo batch."}` : "You’re up to date. Reset the demo to explore the mailbox again.");
+      const assessmentNote = state.classifier?.status === "error" ? "Jev is paused; retry from the Jev panel when ready." : state.classifier?.configured ? "Jev assessment runs in the background; pending labels are previews." : "Local preview labels are shown until Jev is configured.";
+      toast(result.added ? `${result.added} new messages received. ${assessmentNote}` : "You’re up to date. Reset the demo to explore the mailbox again.");
     } catch (error) { toast(error.message, true); }
     finally { const exhausted = state.summary?.demo_batches_remaining === 0; el.disabled = exhausted; el.lastElementChild.textContent = exhausted ? "Demo up to date" : "Simulate sync"; }
   }
@@ -329,7 +446,7 @@
     try {
       const result = await api("/api/import", { method: "POST", body: file, headers: { "Content-Type": "message/rfc822" } });
       await loadInbox();
-      toast("Email imported and sorted. Importing the same file again won’t create a duplicate.");
+      toast(state.classifier?.status === "error" ? "Email imported. Jev is paused; its assessment status is shown in the reader." : state.classifier?.configured ? "Email imported. Check its Jev assessment status in the reader; your manual choices are preserved." : "Email imported. Unassessed messages use local previews until Jev is configured.");
       await openMessage(result.message.id, el);
     } catch (error) { toast(error.message, true); }
     finally { el.disabled = false; }
@@ -392,6 +509,13 @@
   $("nav-toggle").addEventListener("click", () => $("sidebar").classList.contains("nav-open") ? closeNavigation() : openNavigation());
   $("nav-shade").addEventListener("click", closeNavigation);
   window.addEventListener("resize", () => { if (window.innerWidth > 800 && $("sidebar").classList.contains("nav-open")) closeNavigation(); });
+  document.addEventListener("visibilitychange", () => {
+    window.clearTimeout(classificationPollTimer);
+    if (document.visibilityState === "visible" && state.initialized) {
+      if (!state.loading && !state.pending.size) loadInbox({ quiet: true });
+      else scheduleClassificationPoll();
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") { if (!$("reset-overlay").hidden) closeReset(); else if (!$("reader-overlay").hidden) closeReader(); else closeNavigation(); }
     if (event.key === "Tab") { if (!$("reset-overlay").hidden) trapFocus(event, $("reset-overlay")); else if (!$("reader-overlay").hidden) trapFocus(event, $("reader")); else if ($("sidebar").classList.contains("nav-open")) trapFocus(event, $("sidebar")); }

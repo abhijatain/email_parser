@@ -11,3 +11,4 @@ htmlcov/
 .ruff_cache/
 # Parsed emails and extracted files may contain private data.
 output/
+*.jev.lock

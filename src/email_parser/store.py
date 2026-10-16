@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -84,9 +85,20 @@ class InboxStore:
         with self._connection(write=True) as connection:
             connection.execute("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, source TEXT NOT NULL, payload TEXT NOT NULL)")
             connection.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS classification_jobs ("
+                "message_id TEXT PRIMARY KEY, token TEXT NOT NULL, state TEXT NOT NULL, "
+                "model TEXT NOT NULL, rubric TEXT NOT NULL)"
+            )
             seeded = connection.execute("SELECT value FROM state WHERE key = 'seeded_at'").fetchone()
             if seeded is None:
                 self._seed(connection, _utc_now())
+            # Older inboxes contain rule outputs without attribution. Migration
+            # changes only their provenance; existing categories and flags stay.
+            for message in self._rows(connection):
+                if "classification" not in message:
+                    message["classification"] = self._annotation(message)
+                    self._put(connection, message)
 
     @contextmanager
     def _connection(self, *, write: bool = False):
@@ -128,7 +140,15 @@ class InboxStore:
             **classification, "unread": unread, "starred": starred, "archived": False,
             "attachments": [attachment.to_dict() for attachment in parsed.attachments],
             "source": source, "overridden": False,
+            "classification": {"provider": "rules", "status": "preview"},
         }
+
+    @staticmethod
+    def _annotation(message: dict) -> dict:
+        if message.get("overridden"):
+            return {"provider": "manual", "status": "manual"}
+        annotation = message.get("classification")
+        return annotation if isinstance(annotation, dict) else {"provider": "rules", "status": "preview"}
 
     def _seed(self, connection: sqlite3.Connection, now: datetime) -> None:
         for demo in messages_for_batch(0, now):
@@ -220,6 +240,10 @@ class InboxStore:
                 message["reasons"] = [reason for reason in message["reasons"] if not reason.startswith("Priority manually set to ")]
                 message["reasons"].append(f"Priority manually set to {priority}; the ranking uses your selection.")
                 message["overridden"] = True
+            if "category" in changes or "priority" in changes:
+                message["classification"] = {"provider": "manual", "status": "manual"}
+                message["labels"] = [label for label in message["labels"] if label != "Jev AI"]
+                connection.execute("DELETE FROM classification_jobs WHERE message_id = ?", (message_id,))
             self._put(connection, message)
             return message
 
@@ -255,6 +279,9 @@ class InboxStore:
 
     def reset_demo(self) -> None:
         with self._connection(write=True) as connection:
+            # A reset reuses demo IDs. Drop their job tokens before reseeding so
+            # a response for an older instance cannot annotate the new message.
+            connection.execute("DELETE FROM classification_jobs WHERE message_id IN (SELECT id FROM messages WHERE source = 'demo')")
             connection.execute("DELETE FROM messages WHERE source = 'demo'")
             self._seed(connection, _utc_now())
 
@@ -269,3 +296,107 @@ class InboxStore:
             message = self._message(data, message_id, "import", _utc_now())
             self._put(connection, message)
             return message
+
+    @staticmethod
+    def _classification_matches(annotation: dict, model: str, rubric: str) -> bool:
+        # The API may resolve the jev-latest alias to a concrete response model.
+        requested = annotation.get("requested_model", annotation.get("model"))
+        return requested == model and annotation.get("rubric_version") == rubric
+
+    def classification_queue(self, model: str, rubric: str, *, force: bool = False,
+                             retry: bool = False, recover: bool = False) -> None:
+        """Persist eligible jobs, keeping failed work paused until explicit retry."""
+        with self._connection(write=True) as connection:
+            for message in self._rows(connection):
+                if message.get("overridden"):
+                    connection.execute("DELETE FROM classification_jobs WHERE message_id = ?", (message["id"],))
+                    continue
+                annotation = self._annotation(message)
+                matches = self._classification_matches(annotation, model, rubric)
+                state = annotation.get("status")
+                if not force and matches:
+                    if state == "complete" and annotation.get("provider") == "jev":
+                        continue
+                    if state == "failed" and not retry:
+                        continue
+                    if state in {"pending", "processing"} and not recover:
+                        job = connection.execute(
+                            "SELECT 1 FROM classification_jobs WHERE message_id = ?", (message["id"],)
+                        ).fetchone()
+                        if job:
+                            continue
+                message["classification"] = {
+                    **annotation, "status": "pending", "requested_model": model,
+                    "rubric_version": rubric,
+                }
+                message["classification"].pop("error", None)
+                self._put(connection, message)
+                connection.execute(
+                    "INSERT OR REPLACE INTO classification_jobs (message_id,token,state,model,rubric) "
+                    "VALUES (?,?,?,?,?)", (message["id"], uuid.uuid4().hex, "pending", model, rubric),
+                )
+
+    def classification_claim(self, model: str, rubric: str) -> dict | None:
+        """Claim one immutable snapshot in a short transaction, with no I/O."""
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT j.message_id,j.token,m.payload FROM classification_jobs j "
+                "JOIN messages m ON m.id=j.message_id "
+                "WHERE j.state='pending' AND j.model=? AND j.rubric=? ORDER BY j.rowid LIMIT 1",
+                (model, rubric),
+            ).fetchone()
+            if row is None:
+                return None
+            message = json.loads(row[2])
+            if message.get("overridden"):
+                connection.execute("DELETE FROM classification_jobs WHERE message_id=?", (row[0],))
+                return None
+            message["classification"] = {**self._annotation(message), "status": "processing"}
+            self._put(connection, message)
+            connection.execute("UPDATE classification_jobs SET state='processing' WHERE message_id=?", (row[0],))
+            return {"message": message, "token": row[1]}
+
+    def classification_finish(self, message_id: str, token: str, *, result: dict | None = None,
+                              error: str | None = None, model: str, rubric: str) -> bool:
+        """Merge only AI annotations, if this exact job still owns the record."""
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT m.payload FROM messages m JOIN classification_jobs j ON j.message_id=m.id "
+                "WHERE m.id=? AND j.token=? AND j.state='processing'", (message_id, token),
+            ).fetchone()
+            if row is None:
+                return False
+            message = json.loads(row[0])
+            if message.get("overridden"):
+                return False
+            if error is not None:
+                message["classification"] = {**self._annotation(message), "status": "failed", "error": error}
+                connection.execute("UPDATE classification_jobs SET state='failed' WHERE message_id=?", (message_id,))
+            else:
+                for field in ("category", "priority", "score", "labels", "reasons"):
+                    message[field] = result[field]
+                message["classification"] = {
+                    **result["classification"], "requested_model": model, "rubric_version": rubric,
+                }
+                connection.execute("DELETE FROM classification_jobs WHERE message_id=?", (message_id,))
+            self._put(connection, message)
+            return True
+
+    def classification_counts(self, model: str | None, rubric: str) -> dict:
+        """Include archived messages in progress and keep counts mutually exclusive."""
+        with self._connection() as connection:
+            messages = self._rows(connection)
+        counts = {"total": len(messages), "complete": 0, "pending": 0, "failed": 0, "manual": 0, "error": None}
+        for message in messages:
+            annotation = self._annotation(message)
+            if message.get("overridden"):
+                counts["manual"] += 1
+            elif annotation.get("status") == "failed":
+                counts["failed"] += 1
+                counts["error"] = counts["error"] or annotation.get("error")
+            elif (annotation.get("provider") == "jev" and annotation.get("status") == "complete"
+                  and (model is None or self._classification_matches(annotation, model, rubric))):
+                counts["complete"] += 1
+            else:
+                counts["pending"] += 1
+        return counts

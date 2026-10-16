@@ -13,6 +13,8 @@ import sqlite3
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .classification import ClassificationService
+from .jev import JevError, from_environment
 from .store import InboxStore
 from .triage import CATEGORIES, PRIORITIES
 
@@ -42,14 +44,25 @@ class RequestError(Exception):
 class InboxServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], store: InboxStore):
+    def __init__(self, address: tuple[str, int], store: InboxStore, classifier: Any = None):
         self.store = store
+        self.classification: ClassificationService | None = None
         super().__init__(address, InboxHandler)
+        try:
+            self.classification = ClassificationService(store, classifier)
+        except Exception:
+            super().server_close()
+            raise
+
+    def server_close(self) -> None:
+        if self.classification is not None:
+            self.classification.close()
+        super().server_close()
 
 
 class InboxHandler(BaseHTTPRequestHandler):
     server: InboxServer
-    server_version = "InboxAtlas/0.2"
+    server_version = "InboxAtlas/0.3"
     sys_version = ""
 
     def _respond(self, status: int, body: bytes, content_type: str) -> None:
@@ -157,6 +170,7 @@ class InboxHandler(BaseHTTPRequestHandler):
                 "priorities": PRIORITIES,
                 "summary": self.server.store.summary(),
                 "messages": self.server.store.list_messages(**filters),
+                "classifier": self.server.classification.status(),
             })
         elif path.startswith("/api/messages/") and "/" not in path[len("/api/messages/"):]:
             message = self.server.store.get_message(path[len("/api/messages/"):])
@@ -178,17 +192,33 @@ class InboxHandler(BaseHTTPRequestHandler):
             if self._json_body(allow_empty=True):
                 raise RequestError(400, "This action does not accept parameters.")
             if path.endswith("/sync"):
-                self._json(200, self.server.store.sync_demo())
+                result = self.server.store.sync_demo()
+                self.server.classification.enqueue()
+                self._json(200, result)
             else:
                 self.server.store.reset_demo()
+                self.server.classification.enqueue()
                 self._json(200, {"reset": True})
+        elif self.command == "POST" and path in {"/api/classification/retry", "/api/classification/run"}:
+            if self._json_body(allow_empty=True):
+                raise RequestError(400, "This action does not accept parameters.")
+            if not self.server.classification.status()["configured"]:
+                raise RequestError(409, "Jev is not configured. Add the server's TypeSafe API key in environment settings.")
+            result = (
+                self.server.classification.retry()
+                if path.endswith("/retry")
+                else self.server.classification.enqueue(force=True)
+            )
+            self._json(200, result)
         elif self.command == "POST" and path == "/api/import":
             if self.headers.get_content_type() not in {"message/rfc822", "application/octet-stream"}:
                 raise RequestError(415, "Send a raw .eml file as message/rfc822 or application/octet-stream.")
             raw = self._read_body(MAX_EMAIL_BYTES)
             if not raw.strip():
                 raise RequestError(400, "The email file is empty.")
-            self._json(200, {"message": self.server.store.import_email(raw)})
+            message = self.server.store.import_email(raw)
+            self.server.classification.enqueue()
+            self._json(200, {"message": self.server.store.get_message(message["id"])})
         else:
             raise RequestError(404, "Not found.")
 
@@ -223,9 +253,26 @@ class InboxHandler(BaseHTTPRequestHandler):
         logging.info("%s request from %s", self.command, self.client_address[0])
 
 
-def create_server(host: str, port: int, db_path: str | Path) -> InboxServer:
-    """Bind a server; callers own serve_forever(), shutdown(), and server_close()."""
-    return InboxServer((host, port), InboxStore(db_path))
+def create_server(
+    host: str, port: int, db_path: str | Path, *, enable_ai: bool = False, classifier: Any = None
+) -> InboxServer:
+    """Bind an inbox server, with external AI calls opt-in for embedding/tests.
+
+    The command-line app enables Jev from server environment settings. Tests can
+    inject a fake classifier; ordinary factory use never discovers credentials.
+    Callers own serve_forever(), shutdown(), and server_close().
+    """
+    store = InboxStore(db_path)
+    client = classifier if classifier is not None else from_environment() if enable_ai else None
+    try:
+        return InboxServer((host, port), store, client)
+    except Exception:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -233,12 +280,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="port (default: 8000)")
     parser.add_argument("--db", type=Path, default=Path("output/inbox.sqlite3"), help="SQLite inbox file")
+    parser.add_argument("--no-ai", action="store_true", help="show preview labels without making Jev API calls")
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     try:
-        server = create_server(args.host, args.port, args.db)
-    except (OSError, sqlite3.Error) as error:
+        server = create_server(args.host, args.port, args.db, enable_ai=not args.no_ai)
+    except (OSError, sqlite3.Error, JevError, ValueError) as error:
         parser.exit(2, f"email-inbox: {error}\n")
     print(f"Inbox Atlas running on {server.server_address[0]}:{server.server_address[1]} (demo mailbox)", flush=True)
     try:
