@@ -1,3 +1,4 @@
 include .python-version uv.lock
 recursive-include examples *.eml
 recursive-include tests *.py
+recursive-include src/email_parser/static *.html *.css *.js *.svg

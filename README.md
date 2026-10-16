@@ -1,61 +1,67 @@
-# Email parser
+# Inbox Atlas
 
-Parse local `.eml` messages into JSON using Python's standard library. This project provides a command-line tool and a Python API, with no runtime dependencies, inbox access, credentials, or external services.
+A local email triage dashboard with a simulated mailbox. Browse important messages by category, understand their priority, and manage the inbox with persistent read, star, archive, and manual classification controls.
 
-## Set up
+The mailbox is demo data. No real account is connected, and no Gmail, IMAP, or other live integration is implemented. Classification uses explainable rules, with no AI service, credentials, external requests, or runtime dependencies.
 
-Use [uv](https://docs.astral.sh/uv/) to install the project with the pinned Python 3.12 interpreter:
+## Set up and run
+
+Use [uv](https://docs.astral.sh/uv/) with the pinned Python 3.12 interpreter; Python 3.11 or later is supported:
 
 ```sh
 uv sync --frozen
+uv run --frozen email-inbox
 ```
 
-Python 3.11 or later is supported. `uv` installs the build dependency, setuptools, as needed. Alternatively, create a virtual environment and install the package:
+The server defaults to address `127.0.0.1`, port `8000`, and SQLite database `output/inbox.sqlite3`. Open a browser on the same machine and enter `127.0.0.1:8000` in its address bar. Stop the server with Ctrl+C.
+
+Choose another port or database when needed:
 
 ```sh
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -e .
-.venv/bin/email-parser examples/sample.eml --pretty
+uv run --frozen email-inbox --port 8080 --db output/another-inbox.sqlite3
 ```
 
-## Parse a message
+This is a single-user local prototype with no application login. It binds locally by default; use `--host 0.0.0.0` only when sharing on a trusted development network.
+
+## Use the dashboard
+
+- **Priority view** shows the three highest-ranked matching messages in each category. **All messages** shows every matching message. Categories cover Work, Finance, Personal, Travel, Shopping, Newsletters, Security, and Other.
+- Select Inbox, Unread, Starred, or Archived; combine a category, priority filter, and search across sender, subject, and body. Overview counts describe the mailbox, independently of message filters.
+- Open a message to read its full plain-text body, attachment metadata, and the reasons for its category and priority. Rules assign Critical, High, Normal, or Low priority, with higher scores appearing first. Promotional urgency is treated differently from action or security requests.
+- Mark messages read or unread, star them, archive or restore them, and override their category or priority. Manual overrides are recorded and saved.
+- **Simulate sync** adds the next batch from the demo provider. There are three batches; once exhausted, additional syncs add nothing. This never connects to an email account.
+- **Reset demo** restores the original demo messages and its three sync batches after confirmation. Imported messages are preserved.
+- **Import .eml** adds a local message through the same parser and classification pipeline. Imports are limited to 25 MiB; importing identical bytes again does not create another copy. Try `examples/sample.eml`.
+
+The database is created automatically and seeded once. Messages, imports, overrides, flags, and sync progress survive browser refreshes and server restarts when using the same database. The `output/` directory is ignored by Git for local data.
+
+Email HTML is converted to plain text for the dashboard rather than rendered. Attachments are shown as metadata; the dashboard does not execute them or fetch remote content.
+
+## Parse .eml files into JSON
+
+The standalone parser remains available without starting the dashboard:
 
 ```sh
 uv run --frozen email-parser examples/sample.eml --pretty
+uv run --frozen email-parser - --pretty < examples/sample.eml
 ```
 
-JSON goes to standard output by default. Use `--output` (or `-o`) to create a JSON file; an existing file is never overwritten:
+JSON goes to standard output. Omitting the input path also reads stdin. Use `--output` (or `-o`) to create a new file; existing files are never overwritten:
 
 ```sh
 mkdir -p output
 uv run --frozen email-parser examples/sample.eml --pretty -o output/parsed-email.json
 ```
 
-Read standard input by omitting the path or supplying `-`:
+The CLI defaults to a 25 MiB input limit (26,214,400 bytes); `--max-bytes` accepts another positive byte limit. Text and HTML bodies remain separate in JSON. Malformed MIME or charset problems produce best-effort output with warnings where recovery is possible.
 
-```sh
-uv run --frozen email-parser - --pretty < examples/sample.eml
-```
-
-The CLI accepts messages up to 25 MiB (26,214,400 bytes) by default. Set another positive byte limit with `--max-bytes`:
-
-```sh
-uv run --frozen email-parser examples/sample.eml --max-bytes 1048576
-```
-
-Text and HTML bodies remain separate strings. The parser does not render HTML or fetch remote content. Malformed MIME and charset problems produce best-effort output with warnings where recovery is possible.
-
-## Attachments
-
-JSON contains attachment metadata, including `filename`, `content_type`, decoded byte `size`, `content_id`, and `disposition`. Attachment contents are excluded from JSON.
-
-Review the metadata first. To explicitly save attachment bytes after reviewing the message:
+Attachment JSON contains `filename`, `content_type`, decoded byte `size`, `content_id`, and `disposition`, without content bytes. Review that metadata before explicitly extracting attachments:
 
 ```sh
 uv run --frozen email-parser examples/sample.eml --extract-attachments output/attachments
 ```
 
-Extraction uses safe basenames and chooses unique filenames for collisions without overwriting existing files. Each saved attachment's metadata includes `extracted_path`, the absolute saved path. Extracted attachments are never executed. Treat their contents as untrusted. The `output/` directory is ignored by Git for local results.
+Extraction uses safe basenames and unique names for collisions without overwriting files. Saved attachment metadata gains `extracted_path`, the absolute saved path. Attachments are never executed; treat their contents as untrusted.
 
 ## Python API
 
@@ -65,23 +71,26 @@ from pathlib import Path
 from email_parser import parse_email, parse_file
 
 message = parse_file("examples/sample.eml")
-result = message.to_dict()
-print(result["subject"])
-print(result["from"])
+print(message.to_dict()["subject"])
 
-# Parse bytes already in memory.
 message = parse_email(Path("examples/sample.eml").read_bytes())
 attachment_bytes = message.attachments[0].data
 ```
 
-Both functions return a `ParsedEmail`. Its `to_dict()` result includes:
+Both functions return `ParsedEmail`. Its `to_dict()` includes `subject`; address lists `from`, `to`, `cc`, `bcc`, and `reply_to` (each with `name` and `address`); ISO 8601 `date` or `null`; `message_id`; `text`; `html`; attachment metadata; ordered `headers` preserving duplicates; and `warnings`. Attachment objects expose decoded bytes through `.data`. The API imposes no size limit, so callers should enforce their own input limits.
 
-- `subject`; address lists `from`, `to`, `cc`, `bcc`, and `reply_to`, with `name` and `address` for each entry.
-- `date` as an ISO 8601 string or `null`, and `message_id`.
-- `text`, `html`, and attachment metadata in `attachments`.
-- `headers` as an ordered list of `name`/`value` objects, preserving duplicate headers, and `warnings`.
+## Architecture and future integrations
 
-Attachment objects expose decoded bytes through `.data`. The API has no input size limit; callers should enforce a limit when processing untrusted or large inputs.
+| Component | Responsibility |
+| --- | --- |
+| `parser.py`, `cli.py` | Decode MIME messages and provide the standalone JSON tool. |
+| `triage.py` | Assign categories, scores, priorities, labels, and explanations using deterministic rules. |
+| `demo.py` | Supply the initial simulated mailbox and finite sync batches. |
+| `store.py` | Ingest messages and persist inbox state in SQLite. |
+| `server.py` | Serve the dashboard and JSON API using Python's HTTP server. |
+| `static/` | Provide the browser interface with local HTML, CSS, and JavaScript. |
+
+A future Gmail or IMAP adapter can supply raw MIME messages to the same ingestion path used by demo sync and `.eml` imports. Live authentication, account connection, and provider synchronization are deferred.
 
 ## Validate and build
 
@@ -90,4 +99,4 @@ uv run --frozen python -m unittest discover -s tests -v
 uv build
 ```
 
-The sample message contains fictional addresses, a Unicode subject, plain text and HTML alternatives, and a small `report.txt` attachment.
+The build includes the dashboard's static assets. Setuptools is a build dependency managed by `uv`; the running application uses only Python's standard library and browser APIs.
