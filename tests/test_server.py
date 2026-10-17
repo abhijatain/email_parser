@@ -60,7 +60,7 @@ class ServerTests(unittest.TestCase):
         inbox = self.inbox()
         self.assertEqual(inbox["account"]["mode"], "demo")
         self.assertFalse(inbox["account"]["connected"])
-        self.assertEqual(inbox["account"]["provider"], "Simulated mailbox")
+        self.assertEqual(inbox["account"]["provider"], "demo")
         self.assertEqual(inbox["account"]["email"], "alex.morgan@example.com")
         self.assertGreaterEqual(len(inbox["messages"]), 24)
         self.assertEqual(inbox["summary"]["total"], len(inbox["messages"]))

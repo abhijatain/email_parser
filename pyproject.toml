@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "email-parser-local"
-version = "0.3.0"
-description = "An email triage dashboard with Jev AI decisions and a simulated inbox."
+version = "0.4.0"
+description = "A persistent Gmail triage dashboard with Jev AI categorization and priority."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography==50.0.2",
     "typesafe-sdk==0.7.5",
 ]
 

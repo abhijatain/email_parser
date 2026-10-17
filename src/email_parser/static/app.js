@@ -40,6 +40,7 @@
   const priorityIcons = { critical: "lightning", high: "flag", normal: "check", low: "leaf" };
   const viewLabels = { inbox: "Inbox", unread: "Unread", starred: "Starred", archived: "Archived" };
   const state = { messages: [], categories: [], summary: null, account: null, classifier: null, classifierBusy: false, classifierPanelKey: "", pollFailures: 0, mode: "priority", view: "inbox", category: "", priority: "", search: "", loading: false, initialized: false, reader: null, readerRequest: 0, request: 0, controller: null, pending: new Set(), lastFocus: null, resetFocus: null };
+  Object.assign(state, { accounts: [], accountId: "demo", configuration: null, mailbox: null, selection: 0, selectionWrites: Promise.resolve(), preferencesReady: false, preferenceSnapshots: new Map(), preferenceWrites: new Map(), messageWrites: new Map(), accountDialog: null, accountDialogFocus: null, accountBusy: false, accountError: "", accountOptionsKey: "", mailboxPanelKey: "", syncBusyAccount: null });
   let searchTimer;
   let classificationPollTimer;
 
@@ -88,6 +89,266 @@
     return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
   function formatSize(size) { return size >= 1048576 ? `${(size / 1048576).toFixed(1)} MB` : size >= 1024 ? `${Math.round(size / 1024)} KB` : `${size || 0} bytes`; }
+  function accountPath(path, accountId = state.accountId) { const url = new URL(path, window.location.origin); url.searchParams.set("account", accountId); return `${url.pathname}${url.search}`; }
+  function isGmail() { return state.account?.provider === "gmail" || state.account?.mode === "gmail"; }
+  function preferences() { return { view: state.view, mode: state.mode, category: state.category, priority: state.priority, search: state.search }; }
+  function cacheAccount(id) { try { localStorage.setItem("inbox-atlas.account", id); } catch (_) { /* Browser storage may be disabled. Server selection still persists. */ } }
+  function cachedAccount() { try { return localStorage.getItem("inbox-atlas.account"); } catch (_) { return null; } }
+
+  function savePreferences() {
+    if (!state.preferencesReady) return Promise.resolve();
+    const accountId = state.accountId;
+    const changes = preferences();
+    const snapshot = JSON.stringify(changes);
+    if (state.preferenceSnapshots.get(accountId) === snapshot) return state.preferenceWrites.get(accountId) || Promise.resolve();
+    state.preferenceSnapshots.set(accountId, snapshot);
+    const previous = state.preferenceWrites.get(accountId) || Promise.resolve();
+    const write = previous.catch(() => {}).then(() => api(accountPath("/api/preferences", accountId), { method: "PATCH", body: JSON.stringify(changes), keepalive: true })).catch((error) => {
+      if (state.preferenceSnapshots.get(accountId) === snapshot) state.preferenceSnapshots.delete(accountId);
+      toast(`Your view could not be saved. ${error.message}`, true);
+    });
+    state.preferenceWrites.set(accountId, write);
+    return write;
+  }
+
+  function applyPreferences(saved) {
+    const defaults = { view: "inbox", mode: "priority", category: "", priority: "", search: "" };
+    const values = { ...defaults, ...saved };
+    state.view = Object.hasOwn(viewLabels, values.view) ? values.view : "inbox";
+    state.mode = values.mode === "all" ? "all" : "priority";
+    state.category = typeof values.category === "string" ? values.category : "";
+    state.priority = values.priority === "important" || Object.hasOwn(priorityLabels, values.priority) ? values.priority : "";
+    state.search = typeof values.search === "string" ? values.search.slice(0, 500) : "";
+    $("search").value = state.search;
+    $("priority-filter").value = state.priority;
+  }
+
+  async function fetchAccounts() {
+    const data = await api("/api/accounts");
+    state.accounts = data.accounts || [];
+    state.configuration = data.configuration || { configured: false, missing: [] };
+    renderAccountChrome();
+    return data;
+  }
+
+  async function switchAccount(id, options = {}) {
+    if (!state.accounts.some((account) => account.id === id)) return;
+    savePreferences();
+    const selection = ++state.selection;
+    state.preferencesReady = false;
+    state.controller?.abort();
+    ++state.request;
+    window.clearTimeout(searchTimer);
+    window.clearTimeout(classificationPollTimer);
+    if (!$("reader-overlay").hidden) closeReader();
+    state.accountId = id;
+    state.account = state.accounts.find((account) => account.id === id);
+    state.messages = [];
+    state.summary = null;
+    state.classifier = null;
+    state.mailbox = null;
+    state.classifierPanelKey = "";
+    state.mailboxPanelKey = "";
+    state.initialized = false;
+    state.loading = true;
+    applyPreferences({});
+    renderAccountChrome();
+    renderNavigation();
+    $("classifier-panel").hidden = true;
+    $("overview").replaceChildren();
+    $("messages-content").replaceChildren(node("div", { class: "initial-loading" }, node("span", { class: "spinner" }), "Opening your mailbox…"));
+    closeNavigation();
+    cacheAccount(id);
+    try {
+      const existingWrites = state.preferenceWrites.get(id);
+      if (existingWrites) await existingWrites;
+      if (selection !== state.selection) return;
+      const selectionWrite = state.selectionWrites.catch(() => {}).then(() => api("/api/accounts/select", { method: "POST", body: JSON.stringify({ account_id: id }) }));
+      state.selectionWrites = selectionWrite;
+      const [, saved] = await Promise.all([
+        selectionWrite,
+        api(accountPath("/api/preferences", id)),
+      ]);
+      if (selection !== state.selection) return;
+      applyPreferences(saved.preferences || saved);
+      state.preferenceSnapshots.set(id, JSON.stringify(preferences()));
+      state.preferencesReady = true;
+      await loadInbox();
+      if (options.connected && selection === state.selection) toast("Gmail connected. The first 72 hours of mail will arrive as the initial sync completes.");
+    } catch (error) {
+      if (selection !== state.selection) return;
+      state.loading = false;
+      showError(error);
+      $("messages-content").replaceChildren(emptyState("This mailbox is taking a moment", error.message, "Try again", () => switchAccount(id), "mail"));
+    }
+  }
+
+  async function bootstrap() {
+    try {
+      const data = await fetchAccounts();
+      const url = new URL(window.location.href);
+      const outcome = url.searchParams.get("gmail");
+      const returnedAccount = outcome === "connected" ? url.searchParams.get("account") : null;
+      const candidates = [returnedAccount, cachedAccount(), data.active_account_id, "demo"];
+      const selected = candidates.find((id) => state.accounts.some((account) => account.id === id));
+      if (outcome) {
+        url.searchParams.delete("gmail");
+        url.searchParams.delete("account");
+        history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+        if (["denied", "cancelled"].includes(outcome)) toast("Gmail connection was cancelled. Your existing messages are unchanged.");
+        else if (outcome !== "connected") toast("Gmail could not be connected. Open mailbox settings and try again.", true);
+      }
+      if (!selected) throw new Error("No mailbox is available. Restart the server and try again.");
+      await switchAccount(selected, { connected: outcome === "connected" && selected === returnedAccount });
+    } catch (error) {
+      showError(error);
+      $("messages-content").replaceChildren(emptyState("Let’s open your mailboxes", error.message, "Try again", bootstrap, "inbox"));
+    }
+  }
+
+  function renderAccountChrome() {
+    const optionsKey = JSON.stringify(state.accounts.map((account) => [account.id, account.email, account.connected, account.status]));
+    if (optionsKey !== state.accountOptionsKey) {
+      state.accountOptionsKey = optionsKey;
+      $("account-selector").replaceChildren(...state.accounts.map((account) => node("option", { value: account.id }, account.id === "demo" ? "Demo mailbox" : `${account.email}${account.connected ? "" : " · disconnected"}`)));
+    }
+    $("account-selector").value = state.accountId;
+    const account = state.account;
+    const gmail = isGmail();
+    const connected = gmail && account?.connected;
+    const needsAuth = gmail && (!connected || account.status === "needs_reauth");
+    const syncing = gmail && (["queued", "syncing"].includes(state.mailbox?.state) || state.syncBusyAccount === state.accountId);
+    $("account-name").textContent = account?.name || (gmail ? "Gmail mailbox" : "Alex Morgan");
+    $("account-email").textContent = account?.email || "alex.morgan@example.com";
+    $("account-avatar").textContent = initials(account?.name || account?.email || "Alex Morgan");
+    $("sidebar-provider").textContent = gmail ? needsAuth ? "Gmail · sign-in needed" : "Gmail · read-only" : "Demo mailbox";
+    $("sidebar-provider-note").textContent = gmail ? "Your labels and read state are saved in this app." : "Simulated emails. Your changes are saved.";
+    $("provider-pill-text").textContent = gmail ? needsAuth ? "Gmail cached" : "Gmail read-only" : "Demo mode";
+    $("provider-pill").classList.toggle("provider-disconnected", needsAuth);
+    $("reset-demo").hidden = gmail;
+    $("header-account-settings").hidden = !gmail;
+    $("mailbox-footer").textContent = gmail ? "Gmail is read-only. Your labels and read state are saved in this app." : "Demo mailbox. Your changes are saved in this app.";
+    const exhausted = !gmail && state.summary?.demo_batches_remaining === 0;
+    $("sync-button").disabled = gmail ? syncing : exhausted;
+    $("sync-button").lastElementChild.textContent = gmail ? needsAuth ? "Reconnect Gmail" : syncing ? "Syncing Gmail…" : "Sync Gmail" : exhausted ? "Demo up to date" : "Simulate sync";
+    $("sync-button").title = gmail ? needsAuth ? "Sign in again to resume sync. Cached messages are kept." : "Sync new Gmail messages. Your local choices stay unchanged." : exhausted ? "All demo batches are synced. Reset the demo to start again." : "Receive another batch of simulated emails";
+    renderMailboxPanel();
+  }
+
+  function renderMailboxPanel() {
+    const panel = $("mailbox-panel");
+    if (!isGmail()) { panel.hidden = true; state.mailboxPanelKey = ""; return; }
+    const account = state.account;
+    const mailbox = state.mailbox || { state: "idle" };
+    const key = JSON.stringify([account, mailbox, state.syncBusyAccount]);
+    if (key === state.mailboxPanelKey) return;
+    state.mailboxPanelKey = key;
+    const disconnected = !account.connected;
+    const needsAuth = disconnected || account.status === "needs_reauth";
+    const syncing = ["queued", "syncing"].includes(mailbox.state) || state.syncBusyAccount === state.accountId;
+    const failed = !syncing && (mailbox.state === "error" || account.status === "error" || account.status === "needs_reauth");
+    const title = needsAuth ? disconnected ? "Your saved Gmail messages are still here" : "Gmail needs you to sign in again" : failed ? "Gmail sync needs attention" : syncing ? account.initial_import_complete ? "Bringing your Gmail up to date" : "Your first 72 hours of mail are on their way" : account.initial_import_complete ? "Gmail is up to date" : "Ready for your first Gmail sync";
+    const description = needsAuth ? "Reconnect to resume syncing. Existing messages, labels, priorities, and read state stay in this app." : failed ? (mailbox.error || account.error || "Gmail sync paused. Try syncing again when you’re ready.") : syncing ? `${mailbox.processed || 0} processed · ${mailbox.added || 0} newly received. Your saved choices are preserved.` : account.last_synced_at ? `Last synced ${fullDate(account.last_synced_at)}. New mail is checked automatically.` : "New connections import incoming mail from the last 72 hours, then keep receiving new mail.";
+    panel.hidden = false;
+    panel.className = `mailbox-panel${failed || needsAuth ? " mailbox-panel-warning" : ""}`;
+    panel.replaceChildren(node("span", { class: "mailbox-status-icon" }, syncing ? node("span", { class: "spinner" }) : icon(needsAuth ? "warning" : "mail")), node("div", { class: "mailbox-status-copy" }, node("strong", {}, title), node("p", {}, description), node("span", { class: "mailbox-readonly" }, "Gmail read-only · app labels and read state are local")), button(needsAuth ? "Reconnect" : "Settings", "text-button", () => needsAuth ? openAccountDialog("connect", account.id) : openAccountDialog("settings"), needsAuth ? "sync" : null));
+  }
+
+  function openAccountDialog(mode, accountId = null) {
+    state.accountDialogFocus = document.activeElement;
+    state.accountDialog = { mode, accountId };
+    state.accountError = "";
+    closeNavigation();
+    $("account-overlay").hidden = false;
+    document.body.classList.add("body-locked");
+    renderAccountDialog();
+    $("account-overlay").querySelector(".account-dialog").focus();
+    if (mode === "connect" && !state.configuration) refreshGmailConfiguration();
+  }
+
+  function closeAccountDialog() {
+    if (state.accountBusy) return;
+    state.accountDialog = null;
+    $("account-overlay").hidden = true;
+    if ($("reader-overlay").hidden && $("reset-overlay").hidden && !$("sidebar").classList.contains("nav-open")) document.body.classList.remove("body-locked");
+    if (state.accountDialogFocus?.isConnected) state.accountDialogFocus.focus();
+  }
+
+  function renderAccountDialog() {
+    const dialog = state.accountDialog;
+    if (!dialog) return;
+    const account = dialog.accountId ? state.accounts.find((item) => item.id === dialog.accountId) : state.account;
+    const reconnect = dialog.mode === "connect" && !!dialog.accountId;
+    const title = dialog.mode === "disconnect" ? "Disconnect, keep your inbox" : dialog.mode === "settings" ? "Your mailbox, your choices" : reconnect ? "Reconnect Gmail" : "A calmer inbox starts here";
+    const close = button("", "icon-button", closeAccountDialog, "close", { "aria-label": "Close mailbox dialog", disabled: state.accountBusy });
+    const content = node("div", {}, node("div", { class: "account-dialog-top" }, node("span", { class: "account-dialog-icon" }, icon(dialog.mode === "disconnect" ? "archive" : "mail")), close), node("h2", { id: "account-dialog-title" }, title));
+    if (dialog.mode === "connect") {
+      content.append(node("p", { class: "account-dialog-description" }, reconnect ? `Sign in as ${account?.email || "your connected Gmail account"} to resume syncing. Your cached messages and choices stay as they are.` : "Connect your Gmail account securely through Google. Your first sync starts with incoming mail from the last 72 hours."));
+      content.append(node("ul", { class: "connection-promises" }, node("li", {}, icon("sync"), node("span", {}, node("strong", {}, "A focused first sync"), "Last 72 hours for a new connection, then automatic updates for new mail.")), node("li", {}, icon("security"), node("span", {}, node("strong", {}, "Read-only Gmail access"), "This app never changes messages, labels, or read state in Gmail.")), node("li", {}, icon("check"), node("span", {}, node("strong", {}, "Your choices stay saved"), "Stars, archive, labels, priorities, and read state persist here, across restarts."))));
+      const configuration = state.configuration;
+      if (!configuration?.configured) {
+        content.append(node("section", { class: "gmail-setup-note" }, node("strong", {}, configuration ? "One server setup step first" : "Checking Gmail configuration"), node("p", {}, configuration ? "Google sign-in needs an OAuth client configured on the server. Follow the Gmail setup in the project README, then check again." : "The server’s sign-in configuration is being checked."), configuration?.missing?.length ? node("div", { class: "gmail-config-names" }, configuration.missing.map((name) => node("code", {}, name))) : null, configuration?.redirect_uri ? node("p", { class: "gmail-redirect" }, "Authorized redirect URI: ", node("code", {}, configuration.redirect_uri)) : null));
+        content.append(node("div", { class: "dialog-actions" }, button("Close", "button button-outline", closeAccountDialog, null, { disabled: state.accountBusy }), button(state.accountBusy ? "Checking…" : "Check configuration", "button button-primary", refreshGmailConfiguration, "sync", { disabled: state.accountBusy })));
+      } else content.append(node("p", { class: "connection-privacy" }, "Message text and attachment names/types are sent to the configured Jev service for classification. Attachment files are not sent."), node("div", { class: "dialog-actions" }, button("Not now", "button button-outline", closeAccountDialog, null, { disabled: state.accountBusy }), button(state.accountBusy ? "Opening Google…" : "Continue with Google", "button button-primary", startGmailConnection, "arrow", { id: "continue-google", disabled: state.accountBusy })));
+    } else if (dialog.mode === "disconnect") {
+      content.append(node("p", { class: "account-dialog-description" }, `Stop syncing ${account?.email || "this Gmail mailbox"} and remove its saved sign-in tokens from this app. All imported emails, labels, priorities, stars, and read state will remain.`), node("p", { class: "connection-privacy" }, "You can reconnect the same Gmail account later without starting over. This does not change your Gmail account."), node("div", { class: "dialog-actions" }, button("Keep connected", "button button-outline", () => { state.accountDialog = { mode: "settings", accountId: null }; renderAccountDialog(); }, null, { disabled: state.accountBusy }), button(state.accountBusy ? "Disconnecting…" : "Disconnect Gmail", "button button-danger", disconnectGmail, null, { id: "confirm-disconnect", disabled: state.accountBusy })));
+    } else {
+      const gmail = account?.provider === "gmail";
+      content.append(node("p", { class: "settings-account-email" }, account?.email || "Demo mailbox"), node("p", { class: "account-dialog-description" }, gmail ? "Gmail sync is read-only. Your read state, stars, archive, labels, and priorities are stored in this app and survive syncs and restarts." : "This is your simulated mailbox. Messages and your choices are saved locally. Connect Gmail whenever you’re ready."));
+      if (gmail) {
+        content.append(node("dl", { class: "mailbox-settings-facts" }, node("div", {}, node("dt", {}, "Connection"), node("dd", {}, account.connected ? account.status === "needs_reauth" ? "Sign-in needed" : "Connected · read-only" : "Disconnected · cached messages kept")), node("div", {}, node("dt", {}, "First import"), node("dd", {}, account.initial_import_complete ? "Complete · new mail syncs automatically" : "Incoming mail from the first connection’s last 72 hours")), node("div", {}, node("dt", {}, "Last successful sync"), node("dd", {}, account.last_synced_at ? fullDate(account.last_synced_at) : "Not yet synced"))));
+        content.append(node("div", { class: "settings-mailbox-actions" }, button("Sync now", "button button-primary", () => { closeAccountDialog(); syncCurrentAccount(); }, "sync", { disabled: !account.connected || state.syncBusyAccount === account.id || ["queued", "syncing"].includes(state.mailbox?.state) }), button("Reconnect", "button button-outline", () => { state.accountDialog = { mode: "connect", accountId: account.id }; renderAccountDialog(); }, "mail"), account.connected ? button("Disconnect", "button button-subtle-danger", () => { state.accountDialog = { mode: "disconnect", accountId: account.id }; renderAccountDialog(); }) : null));
+      } else content.append(node("div", { class: "dialog-actions" }, button("Done", "button button-outline", closeAccountDialog), button("Connect Gmail", "button button-primary", () => { state.accountDialog = { mode: "connect", accountId: null }; renderAccountDialog(); }, "mail")));
+    }
+    if (state.accountError) content.append(node("div", { class: "account-dialog-error", role: "alert" }, state.accountError));
+    $("account-dialog-content").replaceChildren(content);
+  }
+
+  async function refreshGmailConfiguration() {
+    if (state.accountBusy) return;
+    state.accountBusy = true;
+    state.accountError = "";
+    renderAccountDialog();
+    try { await fetchAccounts(); }
+    catch (error) { state.accountError = error.message; }
+    finally { state.accountBusy = false; renderAccountDialog(); }
+  }
+
+  async function startGmailConnection() {
+    if (state.accountBusy || !state.configuration?.configured) return;
+    state.accountBusy = true;
+    state.accountError = "";
+    renderAccountDialog();
+    try {
+      const result = await api("/api/accounts/gmail/start", { method: "POST", body: JSON.stringify(state.accountDialog?.accountId ? { account_id: state.accountDialog.accountId } : {}) });
+      const authorization = new URL(result.authorization_url);
+      if (authorization.origin !== "https://accounts.google.com" || authorization.username || authorization.password || authorization.hash) throw new Error("The server returned an unexpected Google sign-in address.");
+      await savePreferences();
+      window.location.assign(authorization.href);
+    } catch (error) {
+      state.accountError = error.message;
+      state.accountBusy = false;
+      renderAccountDialog();
+    }
+  }
+
+  async function disconnectGmail() {
+    if (state.accountBusy || !state.accountDialog?.accountId) return;
+    const accountId = state.accountDialog.accountId;
+    state.accountBusy = true;
+    state.accountError = "";
+    renderAccountDialog();
+    try {
+      const result = await api(`/api/accounts/${encodeURIComponent(accountId)}/disconnect`, { method: "POST", body: "{}" });
+      state.accounts = state.accounts.map((account) => account.id === accountId ? result.account : account);
+      if (state.accountId === accountId) state.account = result.account;
+      state.accountBusy = false;
+      closeAccountDialog();
+      await loadInbox({ quiet: true });
+      toast("Gmail disconnected. Your saved messages and choices are still here.");
+    } catch (error) { state.accountError = error.message; }
+    finally { state.accountBusy = false; renderAccountDialog(); }
+  }
 
   async function api(path, options = {}) {
     const response = await fetch(path, { credentials: "same-origin", ...options, headers: { ...(options.body && typeof options.body === "string" ? { "Content-Type": "application/json" } : {}), ...options.headers } });
@@ -107,7 +368,10 @@
   function showError(error) { $("error-text").textContent = error.message || String(error); $("error-banner").hidden = false; }
 
   async function loadInbox(options = {}) {
+    if (!state.preferencesReady) return;
     const quiet = options?.quiet === true;
+    if (!quiet) savePreferences();
+    const accountId = state.accountId;
     const request = ++state.request;
     const readerId = state.reader?.id;
     const readerToken = state.readerRequest;
@@ -117,14 +381,16 @@
     if (!quiet) $("messages-content").setAttribute("aria-busy", "true");
     $("messages-content").setAttribute("aria-live", quiet ? "off" : "polite");
     $("refresh-indicator").hidden = quiet || !state.initialized;
-    const query = new URLSearchParams({ view: state.view });
+    const query = new URLSearchParams({ account: accountId, view: state.view });
     if (state.search) query.set("search", state.search);
     if (state.category) query.set("category", state.category);
     if (state.priority && state.priority !== "important") query.set("priority", state.priority);
     try {
       const data = await api(`/api/inbox?${query}`, { signal: state.controller.signal });
-      if (request !== state.request) return;
+      if (request !== state.request || accountId !== state.accountId) return;
       state.account = data.account;
+      state.accounts = state.accounts.map((account) => account.id === accountId ? { ...account, ...data.account } : account);
+      state.mailbox = data.mailbox || { state: "idle" };
       state.classifier = data.classifier || { configured: false, status: "needs_key", total: 0, complete: 0, pending: 0, failed: 0, manual: 0, model: "jev-latest" };
       state.categories = data.categories;
       state.summary = data.summary;
@@ -138,7 +404,7 @@
       if (error.name === "AbortError" || request !== state.request) return;
       if (quiet) state.pollFailures++;
       showError(error);
-      if (!state.initialized) $("messages-content").replaceChildren(emptyState("Your inbox is taking a moment", "We couldn’t load the demo mailbox. Check that the server is running, then try again.", "Try again", loadInbox, "mail"));
+      if (!state.initialized) $("messages-content").replaceChildren(emptyState("Your inbox is taking a moment", "We couldn’t load this mailbox. Check that the server is running, then try again.", "Try again", loadInbox, "mail"));
     } finally {
       if (request === state.request) {
         state.loading = false;
@@ -155,6 +421,7 @@
     renderNavigation();
     renderOverview();
     renderClassifierPanel();
+    renderAccountChrome();
     renderHeading();
     renderMessages();
     if (focusedMessage) Array.from($("messages-content").querySelectorAll("[data-message-id]")).find((element) => element.dataset.messageId === focusedMessage && element.dataset.messageAction === focusedAction)?.focus({ preventScroll: true });
@@ -163,12 +430,6 @@
     $("priority-mode").setAttribute("aria-pressed", String(state.mode === "priority"));
     $("all-mode").setAttribute("aria-pressed", String(state.mode === "all"));
     $("priority-filter").value = state.priority;
-    $("account-name").textContent = state.account?.name || "Alex Morgan";
-    $("account-email").textContent = state.account?.email || "alex.morgan@example.com";
-    const exhausted = state.summary?.demo_batches_remaining === 0;
-    $("sync-button").title = exhausted ? "All demo batches are synced. Reset the demo to start again." : "Receive another batch of simulated emails";
-    $("sync-button").disabled = exhausted;
-    $("sync-button").lastElementChild.textContent = exhausted ? "Demo up to date" : "Simulate sync";
   }
 
   function createNavItem(view, count) {
@@ -206,7 +467,7 @@
     const panel = $("classifier-panel");
     panel.hidden = false;
     panel.className = `classifier-panel classifier-panel-${!configured ? "setup" : error ? "error" : processing ? "processing" : "ready"}`;
-    const body = node("div", { class: "classifier-copy" }, node("div", { class: "classifier-heading" }, node("strong", {}, title), node("span", { class: "classifier-model" }, model), node("span", { class: "classifier-state" }, !configured ? "Setup needed" : error ? "Needs attention" : processing ? "Assessing" : "Ready")), node("p", {}, description));
+    const body = node("div", { class: "classifier-copy" }, node("div", { class: "classifier-heading" }, node("strong", {}, title), node("span", { class: "classifier-model" }, model), node("span", { class: "classifier-state" }, !configured ? "Setup needed" : error ? "Needs attention" : processing ? "Assessing" : "Ready")), node("p", {}, description), configured && !processing ? node("span", { class: "classifier-scope-note" }, "Retry and reclassify apply across mailboxes; manual choices are preserved.") : null);
     if (configured) {
       body.append(node("div", { class: "classifier-progress-meta" }, node("span", {}, `${complete} of ${total} assessed${status.manual ? ` · ${status.manual} kept manual` : ""}${status.failed ? ` · ${status.failed} failed` : ""}`), processing ? node("span", {}, `${status.pending} pending`) : null));
       if (processing) body.append(node("div", { class: "classifier-progress", role: "progressbar", "aria-label": "Jev assessment progress", "aria-valuemin": 0, "aria-valuemax": total || 1, "aria-valuenow": Math.min(complete, total), "aria-valuetext": `${complete} of ${total} assessed` }, node("span", { style: `width:${total ? Math.min(100, Math.round(complete / total * 100)) : 0}%` })));
@@ -220,10 +481,10 @@
     state.classifierBusy = true;
     renderClassifierPanel();
     try {
-      const result = await api(`/api/classification/${action}`, { method: "POST", body: "{}" });
+      const result = await api(accountPath(`/api/classification/${action}`), { method: "POST", body: "{}" });
       state.classifier = result.classifier || result;
       await loadInbox({ quiet: true });
-      toast(action === "retry" ? "Jev assessment resumed. Your manual choices stay as they are." : "Jev assessment queued. Your manual choices stay as they are.");
+      toast(action === "retry" ? "Jev assessment resumed across mailboxes. Your manual choices stay as they are." : "Jev assessment queued across mailboxes. Your manual choices stay as they are.");
     } catch (error) { toast(error.message, true); await loadInbox({ quiet: true }); }
     finally { state.classifierBusy = false; renderClassifierPanel(); scheduleClassificationPoll(); }
   }
@@ -231,11 +492,16 @@
   function scheduleClassificationPoll() {
     window.clearTimeout(classificationPollTimer);
     const status = state.classifier;
-    if (document.visibilityState === "hidden" || !status?.configured || ["needs_key", "error"].includes(status.status) || !(status.status === "processing" || status.pending > 0)) return;
+    if (document.visibilityState === "hidden" || !state.preferencesReady) return;
+    const aiPending = status?.configured && !["needs_key", "error"].includes(status.status) && (status.status === "processing" || status.pending > 0);
+    const mailboxPending = isGmail() && ["queued", "syncing"].includes(state.mailbox?.state);
+    const gmailConnected = isGmail() && state.account?.connected;
+    if (!aiPending && !mailboxPending && !gmailConnected) return;
+    const interval = aiPending || mailboxPending ? 2000 : 15000;
     classificationPollTimer = window.setTimeout(() => {
       if (state.loading || state.pending.size || state.classifierBusy) scheduleClassificationPoll();
       else loadInbox({ quiet: true });
-    }, 2000 * Math.min(5, 1 + state.pollFailures));
+    }, interval * Math.min(4, 1 + state.pollFailures));
   }
 
   function readerBadges(message) {
@@ -264,7 +530,7 @@
     if (!id || state.reader?.id !== id || token !== state.readerRequest || state.pending.has(id)) return;
     let updated = messages.find((message) => message.id === id);
     if (!updated) {
-      try { updated = await api(`/api/messages/${encodeURIComponent(id)}`); }
+      try { updated = await api(accountPath(`/api/messages/${encodeURIComponent(id)}`)); }
       catch (_) { return; }
     }
     if (state.reader?.id !== id || token !== state.readerRequest || state.pending.has(id)) return;
@@ -358,6 +624,7 @@
   function clearFilters(load = true) { state.category = ""; state.priority = ""; state.search = ""; $("search").value = ""; $("priority-filter").value = ""; window.clearTimeout(searchTimer); if (load) loadInbox(); }
 
   async function openMessage(id, trigger) {
+    const accountId = state.accountId;
     state.lastFocus = trigger || document.activeElement;
     const request = ++state.readerRequest;
     const initial = state.messages.find((message) => message.id === id);
@@ -367,10 +634,14 @@
     document.body.classList.add("body-locked");
     $("reader").focus();
     try {
-      const message = await api(`/api/messages/${encodeURIComponent(id)}`);
-      if (request !== state.readerRequest || $("reader-overlay").hidden) return;
+      const previousWrite = state.messageWrites.get(id);
+      if (previousWrite) await previousWrite;
+      if (request !== state.readerRequest || accountId !== state.accountId || $("reader-overlay").hidden) return;
+      const message = await api(accountPath(`/api/messages/${encodeURIComponent(id)}`, accountId));
+      if (request !== state.readerRequest || accountId !== state.accountId || $("reader-overlay").hidden) return;
       state.reader = message;
       renderReader();
+      await patchMessage(id, { unread: false }, null, { accountId });
     } catch (error) { if (request === state.readerRequest) { toast(error.message, true); if (!initial) closeReader(); } }
   }
 
@@ -378,7 +649,7 @@
     state.readerRequest++;
     state.reader = null;
     $("reader-overlay").hidden = true;
-    if ($("reset-overlay").hidden && !$("sidebar").classList.contains("nav-open")) document.body.classList.remove("body-locked");
+    if ($("reset-overlay").hidden && $("account-overlay").hidden && !$("sidebar").classList.contains("nav-open")) document.body.classList.remove("body-locked");
     if (state.lastFocus?.isConnected) state.lastFocus.focus(); else $("main-content").focus();
   }
 
@@ -396,18 +667,23 @@
     const prioritySelect = node("select", { id: "reader-priority", disabled: busy, onchange: (event) => patchMessage(message.id, { priority: event.target.value }, "Priority updated."), onblur: (event) => { if (state.reader?.id === message.id && !state.pending.has(message.id)) event.target.value = state.reader.priority; } }, Object.keys(priorityLabels).map((priority) => node("option", { value: priority }, priorityLabels[priority])));
     prioritySelect.value = message.priority;
     const attachments = message.attachments?.length ? node("section", { class: "reader-attachments", "aria-label": "Attachments" }, node("h3", { class: "reader-section-title" }, `Attachments · ${message.attachments.length}`), message.attachments.map((attachment) => node("div", { class: "attachment" }, icon("file"), node("div", {}, node("div", { class: "attachment-name" }, attachment.filename || "Unnamed attachment"), node("div", { class: "attachment-meta" }, `${formatSize(attachment.size)} · ${attachment.content_type || "File"}`))))) : null;
-    $("reader-content").replaceChildren(node("div", { class: "reader-toolbar" }, node("span", { class: "reader-toolbar-label" }, "A MOMENT FOR THIS MESSAGE"), button("", "icon-button", closeReader, "close", { id: "close-reader", "aria-label": "Close message" })), node("div", { class: "reader-body" }, node("div", { class: "reader-badges", id: "reader-badges" }, readerBadges(message)), node("h2", { id: "reader-subject" }, message.subject || "(No subject)"), node("div", { class: "reader-sender" }, node("span", { class: "sender-avatar", "aria-hidden": "true" }, initials(name)), node("div", { class: "reader-sender-info" }, node("div", { class: "reader-sender-name" }, name), node("div", { class: "reader-address" }, message.sender.address), node("div", { class: "reader-to" }, `To: ${(message.to || []).map((recipient) => recipient.name ? `${recipient.name} <${recipient.address}>` : recipient.address).join(", ") || "Not specified"}`)), node("time", { class: "reader-received", datetime: message.received_at }, fullDate(message.received_at))), node("div", { class: "reader-actions", "aria-label": "Message actions" }, star, read, archive), node("div", { class: "email-body", "aria-label": "Email body" }, message.text || "This message has no text content."), attachments, readerAssessment(message), node("section", { class: "reader-overrides", "aria-label": "Change classification" }, node("h3", { class: "reader-section-title" }, "Make it your own"), node("p", { class: "override-description" }, "A different place or priority? Your choices are saved automatically."), node("div", { class: "override-fields" }, node("label", { for: "reader-category" }, "Category", categorySelect), node("label", { for: "reader-priority" }, "Priority", prioritySelect))), node("div", { class: "reader-source" }, icon(message.source === "import" ? "upload" : "inbox"), message.source === "import" ? "Imported from a local .eml file" : "From your simulated mailbox · no account connected")));
+    $("reader-content").replaceChildren(node("div", { class: "reader-toolbar" }, node("span", { class: "reader-toolbar-label" }, "A MOMENT FOR THIS MESSAGE"), button("", "icon-button", closeReader, "close", { id: "close-reader", "aria-label": "Close message" })), node("div", { class: "reader-body" }, node("div", { class: "reader-badges", id: "reader-badges" }, readerBadges(message)), node("h2", { id: "reader-subject" }, message.subject || "(No subject)"), node("div", { class: "reader-sender" }, node("span", { class: "sender-avatar", "aria-hidden": "true" }, initials(name)), node("div", { class: "reader-sender-info" }, node("div", { class: "reader-sender-name" }, name), node("div", { class: "reader-address" }, message.sender.address), node("div", { class: "reader-to" }, `To: ${(message.to || []).map((recipient) => recipient.name ? `${recipient.name} <${recipient.address}>` : recipient.address).join(", ") || "Not specified"}`)), node("time", { class: "reader-received", datetime: message.received_at }, fullDate(message.received_at))), node("div", { class: "reader-actions", "aria-label": "Message actions" }, star, read, archive), node("div", { class: "email-body", "aria-label": "Email body" }, message.text || "This message has no text content."), attachments, readerAssessment(message), node("section", { class: "reader-overrides", "aria-label": "Change classification" }, node("h3", { class: "reader-section-title" }, "Make it your own"), node("p", { class: "override-description" }, "A different place or priority? Your choices are saved automatically."), node("div", { class: "override-fields" }, node("label", { for: "reader-category" }, "Category", categorySelect), node("label", { for: "reader-priority" }, "Priority", prioritySelect))), node("div", { class: "reader-source" }, icon(message.source === "import" ? "upload" : "inbox"), message.source === "import" ? "Imported from a local .eml file" : message.source === "gmail" ? "From Gmail · read-only connection · changes are saved in this app" : "From your simulated mailbox · changes are saved in this app")));
     if (focusedId && $(focusedId) && !$(focusedId).disabled) $(focusedId).focus({ preventScroll: true });
   }
 
-  async function patchMessage(id, changes, successMessage) {
+  async function patchMessage(id, changes, successMessage, options = {}) {
     if (state.pending.has(id)) return;
+    const accountId = options.accountId || state.accountId;
+    let settleWrite;
+    const completion = new Promise((resolve) => { settleWrite = resolve; });
+    state.messageWrites.set(id, completion);
     const focusedControl = state.reader?.id === id ? document.activeElement.id : null;
     state.pending.add(id);
     if (state.reader?.id === id) state.readerRequest++;
     if (state.reader?.id === id) renderReader();
     try {
-      const message = await api(`/api/messages/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(changes) });
+      const message = await api(accountPath(`/api/messages/${encodeURIComponent(id)}`, accountId), { method: "PATCH", body: JSON.stringify(changes) });
+      if (accountId !== state.accountId) return;
       state.messages = state.messages.map((item) => item.id === id ? message : item);
       if (state.reader?.id === id) state.reader = message;
       if (successMessage) toast(successMessage);
@@ -418,11 +694,29 @@
       if (state.reader?.id === id) {
         renderReader();
         if (focusedControl && $(focusedControl)) $(focusedControl).focus({ preventScroll: true });
-      } else if (state.initialized) renderMessages();
+      } else if (state.initialized && accountId === state.accountId) renderMessages();
+      if (state.messageWrites.get(id) === completion) state.messageWrites.delete(id);
+      settleWrite();
     }
   }
 
+  async function syncCurrentAccount() {
+    if (!isGmail()) { await syncDemo(); return; }
+    if (!state.account.connected || state.account.status === "needs_reauth") { openAccountDialog("connect", state.accountId); return; }
+    const accountId = state.accountId;
+    if (state.syncBusyAccount === accountId || ["queued", "syncing"].includes(state.mailbox?.state)) return;
+    state.syncBusyAccount = accountId;
+    renderAccountChrome();
+    try {
+      const result = await api(`/api/accounts/${encodeURIComponent(accountId)}/sync`, { method: "POST", body: "{}" });
+      if (state.accountId === accountId) { state.mailbox = result.sync || result; await loadInbox({ quiet: true }); }
+      toast("Gmail sync queued. Your local labels and read state are preserved.");
+    } catch (error) { toast(error.message, true); }
+    finally { if (state.syncBusyAccount === accountId) state.syncBusyAccount = null; renderAccountChrome(); scheduleClassificationPoll(); }
+  }
+
   async function syncDemo() {
+    if (state.accountId !== "demo") return;
     const el = $("sync-button");
     if (el.disabled) return;
     el.disabled = true;
@@ -433,10 +727,11 @@
       const assessmentNote = state.classifier?.status === "error" ? "Jev is paused; retry from the Jev panel when ready." : state.classifier?.configured ? "Jev assessment runs in the background; pending labels are previews." : "Local preview labels are shown until Jev is configured.";
       toast(result.added ? `${result.added} new messages received. ${assessmentNote}` : "You’re up to date. Reset the demo to explore the mailbox again.");
     } catch (error) { toast(error.message, true); }
-    finally { const exhausted = state.summary?.demo_batches_remaining === 0; el.disabled = exhausted; el.lastElementChild.textContent = exhausted ? "Demo up to date" : "Simulate sync"; }
+    finally { renderAccountChrome(); }
   }
 
   async function importEmail(event) {
+    const accountId = state.accountId;
     const file = event.target.files?.[0];
     if (!file) return;
     event.target.value = "";
@@ -444,7 +739,8 @@
     const el = $("import-button");
     el.disabled = true;
     try {
-      const result = await api("/api/import", { method: "POST", body: file, headers: { "Content-Type": "message/rfc822" } });
+      const result = await api(accountPath("/api/import", accountId), { method: "POST", body: file, headers: { "Content-Type": "message/rfc822" } });
+      if (accountId !== state.accountId) { toast("Email imported into the mailbox you selected when importing."); return; }
       await loadInbox();
       toast(state.classifier?.status === "error" ? "Email imported. Jev is paused; its assessment status is shown in the reader." : state.classifier?.configured ? "Email imported. Check its Jev assessment status in the reader; your manual choices are preserved." : "Email imported. Unassessed messages use local previews until Jev is configured.");
       await openMessage(result.message.id, el);
@@ -453,8 +749,9 @@
   }
 
   function openReset() { state.resetFocus = document.activeElement; $("reset-overlay").hidden = false; document.body.classList.add("body-locked"); $("cancel-reset").focus(); }
-  function closeReset() { if ($("confirm-reset").disabled) return; $("reset-overlay").hidden = true; if ($("reader-overlay").hidden && !$("sidebar").classList.contains("nav-open")) document.body.classList.remove("body-locked"); state.resetFocus?.focus(); }
+  function closeReset() { if ($("confirm-reset").disabled) return; $("reset-overlay").hidden = true; if ($("reader-overlay").hidden && $("account-overlay").hidden && !$("sidebar").classList.contains("nav-open")) document.body.classList.remove("body-locked"); state.resetFocus?.focus(); }
   async function resetDemo() {
+    if (state.accountId !== "demo") return;
     $("confirm-reset").disabled = true;
     $("cancel-reset").disabled = true;
     $("confirm-reset").textContent = "Resetting…";
@@ -470,7 +767,7 @@
   }
 
   function openNavigation() { $("sidebar").classList.add("nav-open"); $("nav-shade").hidden = false; $("nav-toggle").setAttribute("aria-expanded", "true"); document.body.classList.add("body-locked"); $("sidebar").querySelector("button")?.focus(); }
-  function closeNavigation() { const wasOpen = $("sidebar").classList.contains("nav-open"); $("sidebar").classList.remove("nav-open"); $("nav-shade").hidden = true; $("nav-toggle").setAttribute("aria-expanded", "false"); if ($("reader-overlay").hidden && $("reset-overlay").hidden) document.body.classList.remove("body-locked"); if (wasOpen) $("nav-toggle").focus(); }
+  function closeNavigation() { const wasOpen = $("sidebar").classList.contains("nav-open"); $("sidebar").classList.remove("nav-open"); $("nav-shade").hidden = true; $("nav-toggle").setAttribute("aria-expanded", "false"); if ($("reader-overlay").hidden && $("reset-overlay").hidden && $("account-overlay").hidden) document.body.classList.remove("body-locked"); if (wasOpen) $("nav-toggle").focus(); }
   function trapFocus(event, container) {
     const items = Array.from(container.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),[tabindex="0"]')).filter((el) => el.offsetParent !== null);
     if (!items.length) return;
@@ -491,14 +788,14 @@
     $("category-total").textContent = state.categories.length;
   }
 
-  $("priority-mode").addEventListener("click", () => { state.mode = "priority"; if (state.initialized) render(); });
-  $("all-mode").addEventListener("click", () => { state.mode = "all"; if (state.initialized) render(); });
+  $("priority-mode").addEventListener("click", () => { state.mode = "priority"; savePreferences(); if (state.initialized) render(); });
+  $("all-mode").addEventListener("click", () => { state.mode = "all"; savePreferences(); if (state.initialized) render(); });
   $("priority-filter").append(node("option", { value: "important" }, "Needs attention"));
   $("priority-filter").addEventListener("change", (event) => { state.priority = event.target.value; loadInbox(); });
   $("search").addEventListener("input", (event) => { const value = event.target.value; window.clearTimeout(searchTimer); searchTimer = window.setTimeout(() => { state.search = value.trim(); loadInbox(); }, 240); });
   $("clear-filters").addEventListener("click", () => clearFilters());
-  $("retry-button").addEventListener("click", loadInbox);
-  $("sync-button").addEventListener("click", syncDemo);
+  $("retry-button").addEventListener("click", () => state.preferencesReady ? loadInbox() : bootstrap());
+  $("sync-button").addEventListener("click", syncCurrentAccount);
   $("import-button").addEventListener("click", () => $("import-file").click());
   $("import-file").addEventListener("change", importEmail);
   $("reset-demo").addEventListener("click", openReset);
@@ -517,11 +814,17 @@
     }
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") { if (!$("reset-overlay").hidden) closeReset(); else if (!$("reader-overlay").hidden) closeReader(); else closeNavigation(); }
-    if (event.key === "Tab") { if (!$("reset-overlay").hidden) trapFocus(event, $("reset-overlay")); else if (!$("reader-overlay").hidden) trapFocus(event, $("reader")); else if ($("sidebar").classList.contains("nav-open")) trapFocus(event, $("sidebar")); }
-    if (event.key === "/" && !event.ctrlKey && !event.metaKey && !event.altKey && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) && $("reader-overlay").hidden && $("reset-overlay").hidden) { event.preventDefault(); closeNavigation(); $("search").focus(); }
+    if (event.key === "Escape") { if (!$("account-overlay").hidden) closeAccountDialog(); else if (!$("reset-overlay").hidden) closeReset(); else if (!$("reader-overlay").hidden) closeReader(); else closeNavigation(); }
+    if (event.key === "Tab") { if (!$("account-overlay").hidden) trapFocus(event, $("account-overlay")); else if (!$("reset-overlay").hidden) trapFocus(event, $("reset-overlay")); else if (!$("reader-overlay").hidden) trapFocus(event, $("reader")); else if ($("sidebar").classList.contains("nav-open")) trapFocus(event, $("sidebar")); }
+    if (event.key === "/" && !event.ctrlKey && !event.metaKey && !event.altKey && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName) && $("reader-overlay").hidden && $("reset-overlay").hidden && $("account-overlay").hidden) { event.preventDefault(); closeNavigation(); $("search").focus(); }
   });
 
+  $("search").maxLength = 500;
+  $("account-selector").addEventListener("change", (event) => switchAccount(event.target.value));
+  $("connect-gmail").addEventListener("click", () => openAccountDialog("connect"));
+  $("account-settings").addEventListener("click", () => openAccountDialog("settings"));
+  $("header-account-settings").addEventListener("click", () => openAccountDialog("settings"));
+  $("account-overlay").addEventListener("click", (event) => { if (event.target === $("account-overlay")) closeAccountDialog(); });
   renderNavigation();
-  loadInbox();
+  bootstrap();
 })();

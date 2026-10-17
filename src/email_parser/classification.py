@@ -128,8 +128,8 @@ class ClassificationService:
                 # Server construction handles its cleanup on failure.
                 raise
 
-    def status(self) -> dict:
-        counts = self.store.classification_counts(self.model, RUBRIC_VERSION)
+    def status(self, account_id: str | None = None) -> dict:
+        counts = self.store.classification_counts(self.model, RUBRIC_VERSION, account_id=account_id)
         with self._state_lock:
             error = self._error or counts["error"]
             if self.classifier is None:

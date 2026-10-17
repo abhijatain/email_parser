@@ -4,19 +4,42 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
 from .demo import BATCH_COUNT, messages_for_batch
 from .parser import parse_email
 from .triage import CATEGORIES, PRIORITIES, classify_email
+
+
+_ACCOUNT_PUBLIC_FIELDS = (
+    "id", "name", "email", "provider", "mode", "connected", "status",
+    "last_synced_at", "initial_import_complete", "error",
+)
+_PREFERENCE_DEFAULTS = {
+    "view": "inbox", "mode": "priority", "category": "", "priority": "", "search": "",
+}
+
+
+def account_public(account: dict) -> dict:
+    """Explicit public allowlist: credentials and sync internals never escape."""
+    return {field: account.get(field) for field in _ACCOUNT_PUBLIC_FIELDS}
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class _PlainHTML(HTMLParser):
@@ -81,10 +104,32 @@ class InboxStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(self.db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+        self.db_path.chmod(0o600)
         self._lock = threading.RLock()
         with self._connection(write=True) as connection:
             connection.execute("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, source TEXT NOT NULL, payload TEXT NOT NULL)")
             connection.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, payload TEXT NOT NULL, token_blob TEXT)")
+            connection.execute("CREATE TABLE IF NOT EXISTS preferences (account_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS auth_states (state_hash TEXT PRIMARY KEY, browser_hash TEXT NOT NULL, "
+                "payload TEXT NOT NULL, expires_at REAL NOT NULL)"
+            )
+            if self._account(connection, "demo") is None:
+                self._put_account(connection, {
+                    "id": "demo", "name": "Alex Morgan", "email": "alex.morgan@example.com",
+                    "provider": "demo", "mode": "demo", "connected": False, "status": "demo",
+                    "last_synced_at": None, "initial_import_complete": True, "error": None,
+                    "history_id": None, "generation": uuid.uuid4().hex,
+                    "initial_since": None, "initial_before": None,
+                })
+            connection.execute("INSERT OR IGNORE INTO state (key,value) VALUES ('active_account_id','demo')")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS classification_jobs ("
                 "message_id TEXT PRIMARY KEY, token TEXT NOT NULL, state TEXT NOT NULL, "
@@ -96,8 +141,15 @@ class InboxStore:
             # Older inboxes contain rule outputs without attribution. Migration
             # changes only their provenance; existing categories and flags stay.
             for message in self._rows(connection):
+                changed = False
                 if "classification" not in message:
                     message["classification"] = self._annotation(message)
+                    changed = True
+                for key, default in (("account_id", "demo"), ("local_flags", {})):
+                    if key not in message:
+                        message[key] = default
+                        changed = True
+                if changed:
                     self._put(connection, message)
 
     @contextmanager
@@ -141,6 +193,7 @@ class InboxStore:
             "attachments": [attachment.to_dict() for attachment in parsed.attachments],
             "source": source, "overridden": False,
             "classification": {"provider": "rules", "status": "preview"},
+            "account_id": "demo", "local_flags": {},
         }
 
     @staticmethod
@@ -162,7 +215,7 @@ class InboxStore:
         return [json.loads(row[0]) for row in connection.execute("SELECT payload FROM messages")]
 
     def list_messages(self, search: str = "", category: str = "", priority: str = "",
-                      view: str = "inbox") -> list[dict]:
+                      view: str = "inbox", account_id: str = "demo") -> list[dict]:
         if any(not isinstance(value, str) for value in (search, category, priority, view)):
             raise ValueError("Inbox filters must be strings")
         if category and category not in {item["id"] for item in CATEGORIES}:
@@ -172,10 +225,13 @@ class InboxStore:
         if view not in {"inbox", "unread", "starred", "archived"}:
             raise ValueError("Unknown inbox view")
         with self._connection() as connection:
+            self._require_account(connection, account_id)
             messages = self._rows(connection)
         query = search.casefold().strip()
         result = []
         for message in messages:
+            if message.get("account_id", "demo") != account_id:
+                continue
             if message["archived"] != (view == "archived"):
                 continue
             if view in {"unread", "starred"} and not message[view]:
@@ -195,12 +251,13 @@ class InboxStore:
         result.sort(key=lambda message: message["score"], reverse=True)
         return result
 
-    def get_message(self, message_id: str) -> dict | None:
+    def get_message(self, message_id: str, account_id: str | None = None) -> dict | None:
         with self._connection() as connection:
             row = connection.execute("SELECT payload FROM messages WHERE id = ?", (message_id,)).fetchone()
-            return json.loads(row[0]) if row else None
+            message = json.loads(row[0]) if row else None
+            return message if message and (account_id is None or message.get("account_id", "demo") == account_id) else None
 
-    def update_message(self, message_id: str, changes: dict) -> dict | None:
+    def update_message(self, message_id: str, changes: dict, account_id: str | None = None) -> dict | None:
         if not isinstance(changes, dict):
             raise ValueError("Changes must be a JSON object")
         allowed = {"unread", "starred", "archived", "category", "priority"}
@@ -223,7 +280,14 @@ class InboxStore:
             if row is None:
                 return None
             message = json.loads(row[0])
+            if account_id is not None and message.get("account_id", "demo") != account_id:
+                return None
             message.update(changes)
+            for flag in ("unread", "starred", "archived"):
+                if flag in changes:
+                    message.setdefault("local_flags", {})[flag] = True
+            if changes.get("unread") is False:
+                message["last_read_at"] = _utc_now().isoformat()
             if "category" in changes:
                 names = {item["name"] for item in CATEGORIES}
                 name = next(item["name"] for item in CATEGORIES if item["id"] == changes["category"])
@@ -247,9 +311,10 @@ class InboxStore:
             self._put(connection, message)
             return message
 
-    def summary(self) -> dict:
+    def summary(self, account_id: str = "demo") -> dict:
         with self._connection() as connection:
-            messages = self._rows(connection)
+            self._require_account(connection, account_id)
+            messages = [message for message in self._rows(connection) if message.get("account_id", "demo") == account_id]
             batch = int(connection.execute("SELECT value FROM state WHERE key = 'demo_batch'").fetchone()[0])
         active = [message for message in messages if not message["archived"]]
         categories = []
@@ -262,7 +327,7 @@ class InboxStore:
                 "important": sum(message["priority"] in {"critical", "high"} for message in active),
                 "starred": sum(message["starred"] for message in active),
                 "archived": len(messages) - len(active), "categories": categories,
-                "demo_batches_remaining": max(0, BATCH_COUNT - batch)}
+                "demo_batches_remaining": max(0, BATCH_COUNT - batch) if account_id == "demo" else 0}
 
     def sync_demo(self) -> dict:
         with self._connection(write=True) as connection:
@@ -281,21 +346,263 @@ class InboxStore:
         with self._connection(write=True) as connection:
             # A reset reuses demo IDs. Drop their job tokens before reseeding so
             # a response for an older instance cannot annotate the new message.
-            connection.execute("DELETE FROM classification_jobs WHERE message_id IN (SELECT id FROM messages WHERE source = 'demo')")
-            connection.execute("DELETE FROM messages WHERE source = 'demo'")
+            demo_ids = [message["id"] for message in self._rows(connection)
+                        if message["source"] == "demo" and message.get("account_id", "demo") == "demo"]
+            connection.executemany("DELETE FROM classification_jobs WHERE message_id = ?", ((item,) for item in demo_ids))
+            connection.executemany("DELETE FROM messages WHERE id = ?", ((item,) for item in demo_ids))
             self._seed(connection, _utc_now())
 
-    def import_email(self, data: bytes) -> dict:
+    def import_email(self, data: bytes, account_id: str = "demo") -> dict:
         if not isinstance(data, bytes):
             raise ValueError("Email input must be bytes")
-        message_id = "import-" + hashlib.sha256(data).hexdigest()
+        prefix = "import-" if account_id == "demo" else f"{account_id}-import-"
+        message_id = prefix + hashlib.sha256(data).hexdigest()
         with self._connection(write=True) as connection:
+            self._require_account(connection, account_id)
             row = connection.execute("SELECT payload FROM messages WHERE id = ?", (message_id,)).fetchone()
             if row:
                 return json.loads(row[0])
             message = self._message(data, message_id, "import", _utc_now())
+            message["account_id"] = account_id
             self._put(connection, message)
             return message
+
+    @staticmethod
+    def _account(connection: sqlite3.Connection, account_id: str) -> dict | None:
+        if not isinstance(account_id, str):
+            return None
+        row = connection.execute("SELECT payload FROM accounts WHERE id=?", (account_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    @classmethod
+    def _require_account(cls, connection: sqlite3.Connection, account_id: str) -> dict:
+        account = cls._account(connection, account_id)
+        if account is None:
+            raise ValueError("Unknown mailbox account")
+        return account
+
+    @staticmethod
+    def _put_account(connection: sqlite3.Connection, account: dict) -> None:
+        connection.execute(
+            "INSERT INTO accounts (id,payload) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+            (account["id"], json.dumps(account, ensure_ascii=False)),
+        )
+
+    @staticmethod
+    def _generation_matches(account: dict | None, expected_generation: str) -> bool:
+        return bool(account and account.get("connected") and account.get("generation") == expected_generation)
+
+    def list_accounts(self) -> list[dict]:
+        with self._connection() as connection:
+            accounts = [json.loads(row[0]) for row in connection.execute("SELECT payload FROM accounts ORDER BY id")]
+        accounts.sort(key=lambda account: (account["id"] != "demo", account["email"].casefold(), account["id"]))
+        return [account_public(account) for account in accounts]
+
+    def get_account(self, account_id: str) -> dict | None:
+        with self._connection() as connection:
+            return self._account(connection, account_id)
+
+    def get_account_tokens(self, account_id: str) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT token_blob FROM accounts WHERE id=?", (account_id,)).fetchone()
+            return row[0] if row else None
+
+    def upsert_gmail_account(self, profile: dict, token_blob: str, now: datetime | None = None,
+                             *, expected_generation: str | None = None) -> dict | None:
+        email = profile.get("emailAddress") if isinstance(profile, dict) else None
+        if not isinstance(email, str):
+            raise ValueError("Gmail did not return a valid account email")
+        email = email.strip().casefold()
+        if (len(email) > 320 or email.count("@") != 1 or not all(email.split("@"))
+                or any(character.isspace() or ord(character) < 32 for character in email)):
+            raise ValueError("Gmail did not return a valid account email")
+        if not isinstance(token_blob, str) or not token_blob:
+            raise ValueError("Encrypted account credentials are required")
+        instant = _utc(now or _utc_now())
+        account_id = "gmail-" + hashlib.sha256(email.encode("utf-8")).hexdigest()
+        with self._connection(write=True) as connection:
+            account = self._account(connection, account_id)
+            # OAuth network operations run outside transactions. Commit only
+            # if no disconnect or competing sign-in changed the begin-time
+            # account. The empty sentinel protects a genuinely new connection.
+            current_generation = account.get("generation") if account is not None else ""
+            if expected_generation is not None and current_generation != expected_generation:
+                return None
+            if account is None:
+                account = {
+                    "id": account_id, "name": email.split("@", 1)[0], "email": email,
+                    "provider": "gmail", "mode": "gmail", "last_synced_at": None,
+                    "initial_import_complete": False, "history_id": None,
+                    "initial_history_id": profile.get("historyId") if isinstance(profile.get("historyId"), str) else None,
+                    "initial_since": (instant - timedelta(hours=72)).isoformat(),
+                    "initial_before": instant.isoformat(),
+                }
+            account.update({"connected": True, "status": "connected", "error": None,
+                            "generation": uuid.uuid4().hex})
+            self._put_account(connection, account)
+            connection.execute("UPDATE accounts SET token_blob=? WHERE id=?", (token_blob, account_id))
+            return account
+
+    def set_account_tokens(self, account_id: str, blob: str, expected_generation: str) -> bool:
+        if not isinstance(blob, str) or not blob:
+            raise ValueError("Encrypted account credentials are required")
+        with self._connection(write=True) as connection:
+            account = self._account(connection, account_id)
+            if not self._generation_matches(account, expected_generation):
+                return False
+            connection.execute("UPDATE accounts SET token_blob=? WHERE id=?", (blob, account_id))
+            return True
+
+    def update_account_sync(self, account_id: str, changes: dict, expected_generation: str) -> bool:
+        allowed = {"history_id", "initial_history_id", "initial_import_complete", "last_synced_at", "status", "error"}
+        if not isinstance(changes, dict) or set(changes) - allowed:
+            raise ValueError("Unknown mailbox sync field")
+        updates = dict(changes)
+        if "initial_import_complete" in updates and type(updates["initial_import_complete"]) is not bool:
+            raise ValueError("Initial import state must be a boolean")
+        for field in ("history_id", "initial_history_id", "error"):
+            if field in updates and updates[field] is not None and not isinstance(updates[field], str):
+                raise ValueError("Invalid mailbox sync value")
+        if "status" in updates and (not isinstance(updates["status"], str) or not updates["status"]):
+            raise ValueError("Invalid mailbox status")
+        if isinstance(updates.get("last_synced_at"), datetime):
+            updates["last_synced_at"] = _utc(updates["last_synced_at"]).isoformat()
+        if "last_synced_at" in updates and updates["last_synced_at"] is not None:
+            if not isinstance(updates["last_synced_at"], str):
+                raise ValueError("Invalid mailbox sync timestamp")
+            try:
+                updates["last_synced_at"] = _utc(datetime.fromisoformat(updates["last_synced_at"])).isoformat()
+            except ValueError:
+                raise ValueError("Invalid mailbox sync timestamp") from None
+        with self._connection(write=True) as connection:
+            account = self._account(connection, account_id)
+            if not self._generation_matches(account, expected_generation):
+                return False
+            account.update(updates)
+            self._put_account(connection, account)
+            return True
+
+    def disconnect_account(self, account_id: str) -> dict:
+        with self._connection(write=True) as connection:
+            account = self._require_account(connection, account_id)
+            if account["provider"] != "gmail":
+                raise ValueError("The simulated mailbox cannot be disconnected")
+            account.update({"connected": False, "status": "disconnected", "error": None,
+                            "generation": uuid.uuid4().hex})
+            self._put_account(connection, account)
+            connection.execute("UPDATE accounts SET token_blob=NULL WHERE id=?", (account_id,))
+            return account_public(account)
+
+    def get_active_account_id(self) -> str:
+        with self._connection() as connection:
+            row = connection.execute("SELECT value FROM state WHERE key='active_account_id'").fetchone()
+            return row[0] if row and self._account(connection, row[0]) is not None else "demo"
+
+    def set_active_account_id(self, account_id: str) -> None:
+        with self._connection(write=True) as connection:
+            self._require_account(connection, account_id)
+            connection.execute("INSERT OR REPLACE INTO state (key,value) VALUES ('active_account_id',?)", (account_id,))
+
+    @staticmethod
+    def _preferences(connection: sqlite3.Connection, account_id: str) -> dict:
+        row = connection.execute("SELECT payload FROM preferences WHERE account_id=?", (account_id,)).fetchone()
+        return {**_PREFERENCE_DEFAULTS, **(json.loads(row[0]) if row else {})}
+
+    def get_preferences(self, account_id: str = "demo") -> dict:
+        with self._connection() as connection:
+            self._require_account(connection, account_id)
+            return self._preferences(connection, account_id)
+
+    def set_preferences(self, account_id: str, changes: dict) -> dict:
+        if not isinstance(changes, dict) or set(changes) - set(_PREFERENCE_DEFAULTS):
+            raise ValueError("Unknown inbox preference")
+        if any(not isinstance(value, str) for value in changes.values()):
+            raise ValueError("Inbox preferences must be strings")
+        choices = {
+            "view": {"inbox", "unread", "starred", "archived"}, "mode": {"priority", "all"},
+            "category": {"", *(category["id"] for category in CATEGORIES)},
+            "priority": {"", "important", *PRIORITIES},
+        }
+        for field, values in choices.items():
+            if field in changes and changes[field] not in values:
+                raise ValueError("Invalid inbox preference")
+        if len(changes.get("search", "")) > 500:
+            raise ValueError("Inbox search must be 500 characters or fewer")
+        with self._connection(write=True) as connection:
+            self._require_account(connection, account_id)
+            preferences = {**self._preferences(connection, account_id), **changes}
+            connection.execute("INSERT OR REPLACE INTO preferences (account_id,payload) VALUES (?,?)",
+                               (account_id, json.dumps(preferences, ensure_ascii=False)))
+            return preferences
+
+    def upsert_remote_message(self, account_id: str, remote: dict, *, expected_generation: str) -> dict | None:
+        remote_id = remote.get("id") if isinstance(remote, dict) else None
+        if not isinstance(remote_id, str) or not remote_id:
+            raise ValueError("Invalid Gmail message ID")
+        if not isinstance(remote.get("raw"), bytes) or not isinstance(remote.get("internal_date"), datetime):
+            raise ValueError("Invalid Gmail message content")
+        labels = remote.get("labels")
+        if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
+            raise ValueError("Invalid Gmail message labels")
+        if not isinstance(remote.get("thread_id"), str):
+            raise ValueError("Invalid Gmail thread ID")
+        message_id = f"{account_id}-message-" + hashlib.sha256(remote_id.encode("utf-8")).hexdigest()
+        with self._connection(write=True) as connection:
+            account = self._account(connection, account_id)
+            if not self._generation_matches(account, expected_generation) or account["provider"] != "gmail":
+                return None
+            row = connection.execute("SELECT payload FROM messages WHERE id=?", (message_id,)).fetchone()
+            inserted = row is None
+            if inserted:
+                message = self._message(remote["raw"], message_id, "gmail", _utc(remote["internal_date"]))
+            else:
+                # Existing body, application labels, decisions and read history
+                # are snapshots. Provider updates affect only provider metadata
+                # and fields that the user has never explicitly changed.
+                message = json.loads(row[0])
+            provider_flags = {"unread": "UNREAD" in labels, "starred": "STARRED" in labels,
+                              "archived": "INBOX" not in labels}
+            for flag, value in provider_flags.items():
+                if not message.get("local_flags", {}).get(flag):
+                    message[flag] = value
+            message.update({"account_id": account_id, "remote_id": remote_id,
+                            "thread_id": remote["thread_id"], "provider_labels": list(labels),
+                            "remote_deleted": False, "received_at": _utc(remote["internal_date"]).isoformat()})
+            self._put(connection, message)
+            return {"message": message, "inserted": inserted}
+
+    def mark_remote_deleted(self, account_id: str, remote_id: str, *, expected_generation: str) -> None:
+        message_id = f"{account_id}-message-" + hashlib.sha256(remote_id.encode("utf-8")).hexdigest()
+        with self._connection(write=True) as connection:
+            if not self._generation_matches(self._account(connection, account_id), expected_generation):
+                return
+            row = connection.execute("SELECT payload FROM messages WHERE id=?", (message_id,)).fetchone()
+            if row is not None:
+                message = json.loads(row[0])
+                message["remote_deleted"] = True
+                if not message.get("local_flags", {}).get("archived"):
+                    message["archived"] = True
+                self._put(connection, message)
+
+    def save_auth_state(self, state_hash: str, browser_hash: str, payload: str, expires_at: float) -> None:
+        if any(not isinstance(value, str) or not value for value in (state_hash, browser_hash, payload)):
+            raise ValueError("Invalid authorization transaction")
+        if type(expires_at) not in {float, int} or not math.isfinite(expires_at):
+            raise ValueError("Invalid authorization expiry")
+        with self._connection(write=True) as connection:
+            connection.execute("DELETE FROM auth_states WHERE expires_at<=?", (time.time(),))
+            connection.execute("INSERT OR REPLACE INTO auth_states (state_hash,browser_hash,payload,expires_at) VALUES (?,?,?,?)",
+                               (state_hash, browser_hash, payload, expires_at))
+
+    def consume_auth_state(self, state_hash: str, browser_hash: str) -> dict | None:
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT payload,expires_at FROM auth_states WHERE state_hash=? AND browser_hash=?", (state_hash, browser_hash),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute("DELETE FROM auth_states WHERE state_hash=?", (state_hash,))
+            return {"payload": row[0], "expires_at": row[1]} if row[1] > time.time() else None
 
     @staticmethod
     def _classification_matches(annotation: dict, model: str, rubric: str) -> bool:
@@ -382,10 +689,13 @@ class InboxStore:
             self._put(connection, message)
             return True
 
-    def classification_counts(self, model: str | None, rubric: str) -> dict:
+    def classification_counts(self, model: str | None, rubric: str, account_id: str | None = None) -> dict:
         """Include archived messages in progress and keep counts mutually exclusive."""
         with self._connection() as connection:
             messages = self._rows(connection)
+            if account_id is not None:
+                self._require_account(connection, account_id)
+                messages = [message for message in messages if message.get("account_id", "demo") == account_id]
         counts = {"total": len(messages), "complete": 0, "pending": 0, "failed": 0, "manual": 0, "error": None}
         for message in messages:
             annotation = self._annotation(message)
